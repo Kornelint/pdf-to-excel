@@ -19,10 +19,13 @@ st.markdown(
 
 def parse_pdf_to_dataframe(reader: PyPDF2.PdfReader) -> pd.DataFrame:
     """
-    Parsuje PyPDF2.PdfReader (zamówienie PDF) tak, żeby:
-    - poprawnie scalić pozycje rozbite między stronami,
-    - odciąć stopki (np. linie zawierające "Strona"),
-    - zebrać zawsze 'Kod kres.' nawet gdy wpadnie nad lub pod nagłówkiem "Lp".
+    Parsuje PDF zamówienia w formacie PyPDF2.PdfReader i zwraca DataFrame z kolumnami:
+    ['Lp', 'Name', 'Quantity', 'Barcode'].
+
+    - Odcina stopki (linie zawierające "Strona").
+    - Łapie wszystkie wystąpienia "Kod kres" w całym bloku tekstu, przypisując je do bieżącej pozycji.
+    - Scalanie bloków produktów rozbitych między stronami.
+    - Na końcu usuwa wiersze, które nie mają nazwy lub ilości.
     """
     products = []
     current = None
@@ -32,10 +35,10 @@ def parse_pdf_to_dataframe(reader: PyPDF2.PdfReader) -> pd.DataFrame:
     for page in reader.pages:
         raw_lines = page.extract_text().split("\n")
 
-        # 1) Odetnij stopkę: wszystko od linii zawierającej "Strona" w dół
+        # 1) Odetnij stopkę: wszystko od momentu, gdy pojawi się wiersz zawierający "Strona"
         footer_idx = None
         for i, ln in enumerate(raw_lines):
-            if "Strona" in ln:  # tu można ewentualnie rozszerzyć o inne słowa stopki
+            if "Strona" in ln:
                 footer_idx = i
                 break
 
@@ -44,44 +47,42 @@ def parse_pdf_to_dataframe(reader: PyPDF2.PdfReader) -> pd.DataFrame:
         else:
             lines = raw_lines
 
-        # 2) Znajdź nagłówek "Lp" (jeśli jest) i zapamiętaj jego indeks
+        # 2) Sprawdź, czy jest nagłówek "Lp" i zapamiętaj jego indeks
         header_idx = None
         for i, ln in enumerate(lines):
             if ln.strip().startswith("Lp"):
                 header_idx = i
                 break
 
-        # 3) Jeśli nagłówek "Lp" się pojawił, to przed headerem wyciągamy
-        #    ewentualne "Kod kres." dla bieżącego current
+        # 3) W całym bloku 'lines' znajdź wszystkie "Kod kres" i przypisz je do bieżącej pozycji
+        for ln in lines:
+            stripped = ln.strip()
+            if "Kod kres" in stripped:
+                parts = stripped.split(":", maxsplit=1)
+                if len(parts) == 2 and current is not None:
+                    candidate = parts[1].strip()
+                    if not current.get("Barcode"):  # przypisz, jeżeli jest puste
+                        current["Barcode"] = candidate
+
+        # 4) Ustal od którego wiersza (start_idx) zaczynamy parsować tabelę:
+        #    - jeśli header_idx istnieje, to start_idx = header_idx + 1
+        #    - jeśli nie, to from 0 (kontynuacja rozbitego bloku)
         if header_idx is not None:
-            for ln in lines[:header_idx]:
-                stripped = ln.strip()
-                if stripped.startswith("Kod kres."):
-                    parts = stripped.split(":", maxsplit=1)
-                    if len(parts) == 2 and current is not None:
-                        barcode = parts[1].strip()
-                        if current.get("Barcode") is None:
-                            current["Barcode"] = barcode
             start_idx = header_idx + 1
         else:
             start_idx = 0
 
-        # 4) Od start_idx aż do końca (bez stopki) – normalne parsowanie:
+        # 5) Od start_idx do końca 'lines' – normalne parsowanie Lp → nazwa → ilość:
         for i in range(start_idx, len(lines)):
             stripped = lines[i].strip()
 
-            # 4a) Jeśli linia zaczyna się od "Kod kres.", przypiszemy do current (jeśli nie ma jeszcze)
-            if stripped.startswith("Kod kres."):
-                parts = stripped.split(":", maxsplit=1)
-                if len(parts) == 2 and current is not None:
-                    barcode = parts[1].strip()
-                    if current.get("Barcode") is None:
-                        current["Barcode"] = barcode
+            # 5a) Jeśli linia zawiera "Kod kres", przeskoczemy, bo już to złapaliśmy w pętli wyżej
+            if "Kod kres" in stripped:
                 continue
 
-            # 4b) Jeśli linia to sama liczba (Lp lub Quantity)
+            # 5b) Jeżeli to sama liczba (może być Lp lub Quantity)
             if re.fullmatch(r"\d+", stripped):
-                # 4b-i) Jeżeli następna linia to "szt.", to traktujemy tę liczbę jako Quantity
+                # 5b-i) Jeżeli następna linia to "szt.", traktujemy tę liczbę jako Quantity
                 if i + 1 < len(lines) and lines[i + 1].strip().lower() == "szt.":
                     qty = int(stripped)
                     if current is not None:
@@ -92,7 +93,7 @@ def parse_pdf_to_dataframe(reader: PyPDF2.PdfReader) -> pd.DataFrame:
                         capture_name = False
                     continue
                 else:
-                    # 4b-ii) W przeciwnym razie – to nowy Lp → tworzymy current od nowa
+                    # 5b-ii) W przeciwnym razie to nowy Lp → tworzymy nowy słownik
                     lp_number = int(stripped)
                     current = {"Lp": lp_number, "Name": None, "Quantity": None, "Barcode": None}
                     products.append(current)
@@ -100,18 +101,16 @@ def parse_pdf_to_dataframe(reader: PyPDF2.PdfReader) -> pd.DataFrame:
                     name_lines = []
                     continue
 
-            # 4c) Jeśli capture_name==True i niepusta linia → to fragment nazwy produktu
+            # 5c) Jeśli capture_name=True i linia nie jest pusta → fragment nazwy produktu
             if capture_name and stripped:
                 name_lines.append(stripped)
                 continue
 
-            # Pozostałe wiersze (np. ceny, VAT, puste) – ignorujemy
+            # Pozostałe wiersze (np. ceny, VAT, puste) ignorujemy
 
-        # Po każdej stronie zachowujemy current, capture_name, name_lines
-        # i przechodzimy do następnej – dzięki temu scalimy bloki przerwane między stronami.
+        # Koniec przetwarzania tej strony → przejdź dalej, zachowując bieżący 'current'
 
-    # 5) Po przejściu wszystkich stron – wybieramy tylko te wiersze,
-    #    które mają Name i Quantity (reszta to "artefakty").
+    # 6) Po przejściu wszystkich stron: stwórz DataFrame i odrzuć niekompletne wiersze
     df = pd.DataFrame(products)
     df = df.dropna(subset=["Name", "Quantity"]).reset_index(drop=True)
     return df
@@ -132,11 +131,11 @@ except Exception as e:
     st.error(f"Nie udało się wczytać PDF-a: {e}")
     st.stop()
 
-# 3) Parsowanie do DataFrame (z komunikatem w trakcie)
+# 3) Parsowanie do DataFrame
 with st.spinner("Analizuję PDF…"):
     df = parse_pdf_to_dataframe(pdf_reader)
 
-# 4) Wyświetlamy wynik w tabeli
+# 4) Wyświetlenie wyniku w tabeli
 st.subheader("Wyekstrahowane pozycje zamówienia")
 st.dataframe(df, use_container_width=True)
 

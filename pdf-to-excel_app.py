@@ -23,35 +23,40 @@ def parse_pdf_to_dataframe(reader: PyPDF2.PdfReader) -> pd.DataFrame:
     ['Lp', 'Name', 'Quantity', 'Barcode'].
 
     Zasady:
-    1. Przechodzimy po kolejnych liniach wszystkich stron (bez stopki "Strona").
-    2. Jeśli linia zawiera wyłącznie liczbę, a następna linia to "szt.", to to jest ilość (Quantity).
-    3. Jeśli linia zawiera wyłącznie liczbę, a następna linia to nie "szt.", to to jest nowy Lp.
-    4. Jeśli linia zawiera frazę "Kod kres", to wyciągamy po niej kod i przypisujemy do bieżącej pozycji.
-    5. Wszystkie inne linie (fragmenty nazwy lub ceny czy VAT) traktujemy tak:
-       - Jeśli capture_name=True, a linia nie jest pusta i nie jest liczba, dopisujemy ją jako fragment nazwy.
-       - Jeśli linia jest pusta lub zawiera cenę czy VAT, pozycja nazwy się domyka dopiero, gdy natrafimy na ilość.
-    6. Na końcu odrzucamy wiersze bez Name lub bez Quantity.
+    1. Zbiera wszystkie linie (bez stopki "Strona") w kolejności, jak w PDF-ie.
+    2. Pomija linie nagłówka tabeli zaczynające się od "Lp" (ale nie czyste liczby).
+    3. Jeśli linia zawiera frazę "Kod kres", wyciąga kod i przypisuje go do bieżącej pozycji,
+       o ile nie ma jeszcze przypisanego barcode.
+    4. Jeśli linia to sama liczba, a następna linia to "szt.", traktuje to jako Quantity.
+    5. Jeśli linia to sama liczba i następna linia ≠ "szt.", to jest nowy Lp.
+    6. Jeżeli capture_name=True i linia nie-pusta, traktuje ją jako fragment nazwy.
+    7. Na końcu usuwa wiersze, które nie mają ani Name, ani Quantity.
     """
     products = []
     current = None
     capture_name = False
     name_lines = []
 
-    # Zbierz wszystkie linie (bez stopki "Strona …")
+    # 1) Zbierz wszystkie linie z każdej strony, pomijając stopki i nagłówki “Lp”
     all_lines = []
     for page in reader.pages:
         raw = page.extract_text().split("\n")
         for ln in raw:
-            if "Strona" in ln:
-                break  # ignorujemy wszystko od "Strona" dalej na tej stronie
-            all_lines.append(ln)
+            stripped = ln.strip()
+            # Jeśli spotkamy linię stopki (zawiera "Strona"), przerywamy tę stronę
+            if "Strona" in stripped:
+                break
+            # Jeśli linia to nagłówek tabeli zaczynający się od "Lp" i nie jest czystą liczbą – pomiń
+            if stripped.startswith("Lp") and not stripped.isdigit():
+                continue
+            all_lines.append(stripped)
 
-    # Przechodzimy po wszystkich liniach w kolejności, jak w PDF-ie
+    # 2) Iterujemy po wszystkich liniach w kolejności
     i = 0
     while i < len(all_lines):
-        ln = all_lines[i].strip()
+        ln = all_lines[i]
 
-        # 1) "Kod kres" w dowolnym miejscu linii?
+        # 2a) Jeżeli linia zawiera "Kod kres", to wyciągnij EAN i przypisz do bieżącej pozycji
         if "Kod kres" in ln:
             parts = ln.split(":", maxsplit=1)
             if len(parts) == 2 and current is not None:
@@ -61,14 +66,14 @@ def parse_pdf_to_dataframe(reader: PyPDF2.PdfReader) -> pd.DataFrame:
             i += 1
             continue
 
-        # 2) Czy linia to sama liczba?
+        # 2b) Czy ln to sama liczba? (może to być Lp lub Quantity)
         if re.fullmatch(r"\d+", ln):
-            # 2a) Jeżeli następna linia to "szt.", to traktujemy ln jako Quantity
-            if i + 1 < len(all_lines) and all_lines[i + 1].strip().lower() == "szt.":
+            # 2b-i) Jeżeli następna linia to "szt.", to to jest Quantity
+            if i + 1 < len(all_lines) and all_lines[i + 1].lower() == "szt.":
                 qty = int(ln)
                 if current is not None:
                     current["Quantity"] = qty
-                    # Po ilości znaczy: nazwa się kończy, scal fragmenty
+                    # Po uzupełnieniu ilości – łączymy nazwy
                     full_name = " ".join(name_lines).strip()
                     current["Name"] = full_name
                     name_lines = []
@@ -76,7 +81,7 @@ def parse_pdf_to_dataframe(reader: PyPDF2.PdfReader) -> pd.DataFrame:
                 i += 2  # pomijamy także "szt."
                 continue
             else:
-                # 2b) W przeciwnym wypadku ln to nowy Lp
+                # 2b-ii) To nowy Lp
                 Lp = int(ln)
                 current = {"Lp": Lp, "Name": None, "Quantity": None, "Barcode": None}
                 products.append(current)
@@ -85,16 +90,16 @@ def parse_pdf_to_dataframe(reader: PyPDF2.PdfReader) -> pd.DataFrame:
                 i += 1
                 continue
 
-        # 3) Jeżeli capture_name=True i linia nie jest pusta → fragment nazwy
+        # 2c) Jeżeli capture_name=True i ln nie-puste → fragment nazwy
         if capture_name and ln:
             name_lines.append(ln)
             i += 1
             continue
 
-        # 4) Wszelkie inne wiersze (np. puste, ceny, VAT) po prostu pomijamy
+        # 2d) Wszelkie inne wiersze (np. ceny, VAT, puste) – pomijamy
         i += 1
 
-    # 5) Po przetworzeniu wszystkich linii, utwórz DataFrame i przefiltruj
+    # 3) Po przetworzeniu wszystkich linii, utwórz DataFrame i usuń wiersze niekompletne
     df = pd.DataFrame(products)
     df = df.dropna(subset=["Name", "Quantity"]).reset_index(drop=True)
     return df

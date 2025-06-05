@@ -1,5 +1,3 @@
-# app.py
-
 import streamlit as st
 import pandas as pd
 import re
@@ -23,13 +21,13 @@ st.markdown(
        - Zlokalizuje wszystkie linie „Kod kres.: <EAN>” i utworzy listę indeksów `idx_ean`.
        - Podzieli `all_lines` na „interwały” oddzielone pozycjami Lp. Dla każdej pozycji Lp weźmie dokładnie te linie, 
          które między nią a następną pozycją Lp się znajdują. W tej grupie:
-         • znajdzie tzw. `qty_idx` (pierwszą linię będącą czystą liczbą, której kolejna linia to "szt.") → to jest `Quantity`,  
+         • znajdzie tzw. `qty_idx` (pierwszą linię będącą czystą liczbą, której kolejna linia to "szt.") → to jest `Ilość`,  
          • zbierze fragmenty nazwy – wszystkie wiersze zawierające litery (nie wyglądające jak cena, nie zaczynające się od “VAT”, nie będące “/”, 
            nie zaczynające się od “ARA” ani “KAT”), zarówno _przed_ jak i _po_ kolumnie ilości/ceny, aż do momentu napotkania linii “Kod kres”.  
          • spośród `idx_ean` wybierze ten indeks `e` (jeśli istnieje), który leży w przedziale `(poprzednie_Lp, następne_Lp)` i jest największy (czyli EAN dla tej pozycji).  
-       • Sklei pełną nazwę, ustawi `Quantity`, pobierze `Barcode`.  
+       • Sklei pełną nazwę, ustawi `Ilość`, pobierze `Symbol`.  
     3. Wyświetli wynik jako tabelę z kolumnami:
-       `Lp`, `Name`, `Quantity`, `Barcode`  
+       `Lp`, `Name`, `Ilość`, `Symbol`  
        oraz umożliwi pobranie pliku Excel, zawierającego te cztery kolumny.
     """
 )
@@ -46,9 +44,9 @@ def parse_pdf_generic(reader: PyPDF2.PdfReader) -> pd.DataFrame:
       3) Wyszukiwanie indeksów EAN (linia zaczynająca się od "Kod kres").
       4) Dla każdego Lp pobieranie:
          - `Name`: wszystkie wiersze z literami (przed i po cenach) aż do napotkania linii "Kod kres",
-         - `Quantity`: ta liczba, której kolejna linia to "szt.",
-         - `Barcode`: EAN wybrany spośród wszystkich “Kod kres” leżących między tą pozycją Lp a następnym Lp.
-      5) Zwraca pandas.DataFrame z kolumnami ['Lp', 'Name', 'Quantity', 'Barcode'].
+         - `Ilość`: ta liczba, której kolejna linia to "szt.",
+         - `Symbol`: EAN wybrany spośród wszystkich „Kod kres” leżących między tą pozycją Lp a następnym Lp.
+      5) Zwraca pandas.DataFrame z kolumnami ['Lp', 'Name', 'Ilość', 'Symbol'].
     """
 
     # 1) Scal wszystkie strony w all_lines, pomijając stopy i nagłówki
@@ -117,34 +115,34 @@ def parse_pdf_generic(reader: PyPDF2.PdfReader) -> pd.DataFrame:
     # 3) Znajdź indeksy wszystkich "Kod kres"
     idx_ean = [i for i, ln in enumerate(all_lines) if ln.startswith("Kod kres")]
 
-    # 4) Dla każdej pozycji Lp zbierz Name, Quantity i Barcode
+    # 4) Dla każdej pozycji Lp zbierz Name, Ilość i Symbol
     products = []
     for idx, lp_idx in enumerate(idx_lp):
         prev_lp = idx_lp[idx - 1] if idx > 0 else -1
         next_lp = idx_lp[idx + 1] if idx + 1 < len(idx_lp) else n
 
         # 4a) Wybierz EAN w przedziale między poprzednim lp a kolejnym lp
-        ean = None
+        symbol = None
         valid_eans = [e for e in idx_ean if prev_lp < e < next_lp]
         if valid_eans:
             # bierzemy ten z największym indeksem (czyli najbliższy Lp od dołu)
             e = max(valid_eans)
             parts = all_lines[e].split(":", 1)
             if len(parts) == 2:
-                ean = parts[1].strip()
+                symbol = parts[1].strip()
 
         # 4b) Zbierz fragmenty nazwy i ilość
         name_parts = []
-        qty = None
+        ilosc = None
         qty_idx = None
 
         # ● Najpierw kolejne linie aż do wiersza "ilość":
         for j in range(lp_idx + 1, next_lp):
             ln = all_lines[j]
-            # jeśli trafimy na "ilość" (liczba, a poniższa linia to dokładnie "szt.") → to Quantity
+            # jeśli trafimy na "ilość" (liczba, a poniższa linia to dokładnie "szt.") → to Ilość
             if re.fullmatch(r"\d+", ln) and (j + 1 < next_lp and all_lines[j + 1].lower() == "szt."):
                 qty_idx = j
-                qty = int(ln)
+                ilosc = int(ln)
                 break
 
             # w przeciwnym razie, jeżeli to linia z literami, ale nie wygląda jak cena, nie zaczyna się od "VAT", nie jest "/" i nie jest kodem katalogowym "ARA..." lub "KAT..."
@@ -188,14 +186,14 @@ def parse_pdf_generic(reader: PyPDF2.PdfReader) -> pd.DataFrame:
             {
                 "Lp": int(all_lines[lp_idx]),
                 "Name": Name_val,
-                "Quantity": qty,
-                "Barcode": ean,
+                "Ilość": ilosc,
+                "Symbol": symbol,
             }
         )
 
     # 5) Zbuduj DataFrame i usuń wiersze brakujące nazwy lub ilości
     df = pd.DataFrame(products)
-    df = df.dropna(subset=["Name", "Quantity"]).reset_index(drop=True)
+    df = df.dropna(subset=["Name", "Ilość"]).reset_index(drop=True)
     return df
 
 

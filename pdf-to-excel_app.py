@@ -11,85 +11,83 @@ st.title("Konwerter zamówienia PDF → Excel")
 
 st.markdown(
     """
-    Wgraj plik PDF ze zamówieniem. Skrypt połączy wszystkie strony w jedną listę wierszy 
-    (pomiatając stopki i nagłówki „Lp”), a następnie wyciągnie:
-    - numer pozycji (Lp),
-    - wszystkie fragmenty nazwy (z jednej lub wielu linii),
-    - ilość (linia „<liczba>” + kolejna linia „szt.”),
-    - kod EAN (linia zawierająca „Kod kres.”).
-
-    Dzięki temu pozycje rozbite na dwie strony (gdzie „Kod kres.” trafia dopiero później) 
-    zostaną poprawnie scalone i mają przypisany EAN.
+    Wgraj plik PDF ze zamówieniem. Aplikacja:
+    1) Połączy wszystkie strony w jeden ciąg linii (pomijając stopki i nagłówki „Lp”),
+    2) Wyłuska numer pozycji (Lp), fragmenty nazwy (z jednej lub wielu linii),
+       ilość (linia „<liczba>” + kolejna linia „szt.”) oraz kod EAN (linia zawierająca „Kod kres.”),
+    3) Scal pozycje rozbite na dwie strony (tak, by „Kod kres.” trafił do tej samej pozycji),
+    4) Na koniec wyświetli wynik w tabeli oraz da możliwość pobrania pliku Excel.
     """
 )
 
 
 def parse_pdf_to_dataframe(reader: PyPDF2.PdfReader) -> pd.DataFrame:
     """
-    1. Łączy wszystkie strony PDF w jeden ciąg linii, pomijając:
-       - każdą linię od słowa "Strona" w dół (stopka),
-       - każdą linię rozpoczynającą się od "Lp" niebędącą liczbową (nagłówek tabeli).
-
-    2. Przechodzi kolejno po tej zunifikowanej liście:
-       - Gdy znajdzie "Kod kres" → wyciąga kod i przypisuje go do bieżącej pozycji.
-       - Gdy linia to sama liczba, a następna to "szt." → to jest Quantity.
-       - Gdy linia to sama liczba, a następna to nie "szt." → to jest nowy Lp.
-       - W trybie capture_name (po wykryciu nowego Lp) każda niepusta linia 
-         (która nie jest czystą liczbą ani "Kod kres") dokłada się do name_lines.
-    3. Po zakończeniu pierwszego przejścia buduje DataFrame i odrzuca wiersze 
-       bez nazwy lub ilości.
+    Zwraca DataFrame z kolumnami ['Lp', 'Name', 'Quantity', 'Barcode'], wczytując wszystkie
+    strony PDF-a i łącząc je w jeden ciąg linii (bez stopek i nagłówków). Dzięki temu kod EAN
+    dla produktów rozbitych między stronami trafia poprawnie do ich pozycji.
     """
     products = []
     current = None
     capture_name = False
     name_lines = []
 
-    # 1) Połącz wszystkie strony w jedną listę linii, pomijając stopki i nagłówki "Lp"
+    # 1) Połącz wszystkie strony w jedną listę wierszy (wszystkie linie, bez stopek/nagłówków)
     all_lines = []
+    started = False
     for page in reader.pages:
         raw = page.extract_text().split("\n")
         for ln in raw:
             stripped = ln.strip()
-            # jeśli napotkamy stopkę (linia zawiera "Strona"), przerywamy tę stronę
+            # dopóki nie napotkamy nagłówka "Lp", nic nie zbieramy:
+            if not started:
+                if stripped.startswith("Lp") and not stripped.isdigit():
+                    started = True
+                continue
+            # po wykryciu "Lp" – dodawajemy linie aż do napotkania stopki ("Strona")
             if "Strona" in stripped:
                 break
-            # jeśli linia to nagłówek tabeli, tzn. zaczyna się od "Lp" i nie jest czystą liczbą, pomijamy
+            # pomijamy każdą kolejną linię nagłówka "Lp" (jeśli się pojawi ponownie)
             if stripped.startswith("Lp") and not stripped.isdigit():
                 continue
-            # w każdym innym wypadku dopisujemy do all_lines (może to być fragment nazwy, ilość, kod, itp.)
+            # w pozostałych wierszach zapisujemy;text
             all_lines.append(stripped)
 
-    # 2) Przejdź kolejno po all_lines
+    # 2) Iterujemy po all_lines i wyłuskujemy Lp, Name, Quantity oraz Barcode:
     i = 0
     while i < len(all_lines):
         ln = all_lines[i]
 
-        # 2a) Jeśli linia zawiera "Kod kres", wyciągnij kod po ":" i przypisz do current
+        # 2a) Jeżeli wiersz zawiera "Kod kres", wyciągamy po ":" kod EAN i przypisujemy do
+        #     bieżącej pozycji (jeśli jeszcze nie ma Barcode):
         if "Kod kres" in ln:
             parts = ln.split(":", maxsplit=1)
-            if len(parts) == 2 and current is not None:
+            if len(parts) == 2 and current:
                 ean = parts[1].strip()
                 if not current.get("Barcode"):
                     current["Barcode"] = ean
             i += 1
             continue
 
-        # 2b) Jeśli ln to sama liczba → może być Lp lub Quantity
+        # 2b) Jeżeli ln to sama liczba – może to być Lp albo Quantity:
         if re.fullmatch(r"\d+", ln):
-            # 2b-i) Jeśli następna linia to "szt.", traktujemy ln jako Quantity
-            if i + 1 < len(all_lines) and all_lines[i + 1].lower() == "szt.":
+            nxt = all_lines[i + 1] if (i + 1) < len(all_lines) else ""
+
+            # 2b-i) Jeśli następna linia to "szt.", to traktujemy ln jako Quantity:
+            if nxt.lower() == "szt.":
                 qty = int(ln)
-                if current is not None:
+                if current:
                     current["Quantity"] = qty
-                    # po ustaleniu ilości łączymy name_lines w jedno pole Name
                     full_name = " ".join(name_lines).strip()
                     current["Name"] = full_name
                     name_lines = []
                     capture_name = False
-                i += 2  # pomijamy też wiersz "szt."
+                i += 2  # pomijamy także linię "szt."
                 continue
-            else:
-                # 2b-ii) To jest nowy Lp → zakładamy początek nowego produktu
+
+            # 2b-ii) Jeśli następna linia zawiera litery (a nie zaczyna się od "Kod kres"), 
+            #        uznajemy ln za nowy numer pozycji (Lp):
+            elif re.search(r"[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż]", nxt) and not nxt.startswith("Kod kres"):
                 Lp = int(ln)
                 current = {"Lp": Lp, "Name": None, "Quantity": None, "Barcode": None}
                 products.append(current)
@@ -98,16 +96,38 @@ def parse_pdf_to_dataframe(reader: PyPDF2.PdfReader) -> pd.DataFrame:
                 i += 1
                 continue
 
-        # 2c) Jeśli capture_name=True i ln nie jest pusty → to fragment nazwy
-        if capture_name and ln:
-            name_lines.append(ln)
+            # 2b-iii) W przeciwnym razie to „liczbowe artefakty” (np. cena czy numer w stopce) – pomijamy:
+            else:
+                i += 1
+                continue
+
+        # 2c) Jeżeli capture_name == True i ln nie jest pusty → to fragment nazwy:
+        if capture_name:
+            #  - Linie w formacie „123,45” lub „1 234,56” to ceny – pomiń:
+            if re.fullmatch(r"\d{1,3}(?: \d{3})*,\d{2}", ln):
+                i += 1
+                continue
+            #  - Linie zaczynające się od "VAT" to nagłówki VAT – pomiń:
+            if ln.startswith("VAT"):
+                i += 1
+                continue
+            #  - Jednoznacznie "/" to osobny wiersz opisu (pomijamy):
+            if ln == "/":
+                i += 1
+                continue
+            #  - Jeśli linia zawiera przynajmniej jedną literę (polską albo łacińską), traktujemy ją jako część nazwy:
+            if re.search(r"[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż]", ln):
+                name_lines.append(ln)
+                i += 1
+                continue
+            #  - W przeciwnym razie nie jest to ani nazwa, ani cena, ani VAT – pomijamy:
             i += 1
             continue
 
-        # 2d) Wszystkie inne wiersze (np. puste, zawierające cenę/VAT itp.) pomijamy
+        # 2d) W innym wypadku (puste wiersze itp.) – pomiń:
         i += 1
 
-    # 3) Zbuduj DataFrame i odfiltruj wiersze niekompletne
+    # 3) Na koniec budujemy DataFrame i odrzucamy wiersze niekompletne (brak nazwy lub ilości)
     df = pd.DataFrame(products)
     df = df.dropna(subset=["Name", "Quantity"]).reset_index(drop=True)
     return df
@@ -115,28 +135,28 @@ def parse_pdf_to_dataframe(reader: PyPDF2.PdfReader) -> pd.DataFrame:
 
 # ──────────────────────────────────────────────────────────────────────────────
 
-# FileUploader: pozwala wgrać PDF
+# 1) File Uploader: wczytanie PDF-a
 uploaded_file = st.file_uploader("Wybierz plik PDF ze zamówieniem", type=["pdf"])
 if uploaded_file is None:
     st.info("Proszę wgrać plik PDF, aby uruchomić parser.")
     st.stop()
 
-# Czytanie PDF-a
+# 2) Odczyt PDF-a
 try:
     pdf_reader = PyPDF2.PdfReader(uploaded_file)
 except Exception as e:
     st.error(f"Nie udało się wczytać PDF-a: {e}")
     st.stop()
 
-# Parsowanie do DataFrame
+# 3) Parsowanie do DataFrame
 with st.spinner("Łączę strony i analizuję PDF…"):
     df = parse_pdf_to_dataframe(pdf_reader)
 
-# Wyświetlenie tabeli w Streamlit
+# 4) Wyświetlenie wyniku w tabeli
 st.subheader("Wyekstrahowane pozycje zamówienia")
 st.dataframe(df, use_container_width=True)
 
-# Przygotowanie przycisku do pobrania jako Excel
+# 5) Pobranie wyniku jako plik Excel
 def convert_df_to_excel(df_in: pd.DataFrame) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:

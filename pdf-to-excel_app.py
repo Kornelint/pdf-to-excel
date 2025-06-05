@@ -1,57 +1,27 @@
-# app.py
-
-import streamlit as st
-import pandas as pd
 import re
+import pandas as pd
 import PyPDF2
-import io
 
-st.set_page_config(page_title="PDF → Excel", layout="wide")
-st.title("Konwerter zamówienia PDF → Excel")
-
-st.markdown(
-    """
-    Ten prosty demo-aplikacja Streamlit pozwala wczytać plik PDF 
-    (zamówienie, gdzie każda pozycja rozbita jest na kilka wierszy) i 
-    wyeksportować go do Excela.  
-    Plik musi zawierać nagłówek „Lp” oraz wiersze w układzie:  
-    - numer pozycji (liczba)  
-    - fragmenty nazwy (może być 2–3 wiersze)  
-    - ilość (liczba) i wiersz „szt.”  
-    - na końcu blok z „Kod kres.: XXXXXXXX”  
-    """
-)
-
-# 1) Użytkownik wrzuca PDF
-uploaded_file = st.file_uploader("Wybierz plik PDF ze zamówieniem", type=["pdf"])
-if uploaded_file is None:
-    st.info("Proszę wgrać plik PDF, aby uruchomić parser.")
-    st.stop()
-
-# 2) Gdy użytkownik wrzuci plik, odczytujemy jego zawartość
-try:
-    # PyPDF2 oczekuje pliku "readable()" → dlatego wyciągamy bajty
-    pdf_reader = PyPDF2.PdfReader(uploaded_file)
-except Exception as e:
-    st.error(f"Nie udało się wczytać PDF-a: {e}")
-    st.stop()
-
-# 3) Funkcja, która na podstawie wczytanych stron tworzy DataFrame
 def parse_pdf_to_dataframe(reader: PyPDF2.PdfReader) -> pd.DataFrame:
+    """
+    Parsuje PyPDF2.PdfReader (zamówienie PDF) w taki sposób, żeby:
+    - wykrywać bloki pozycji na wielu stronach,
+    - odrzucać stopki ("Strona ..."),
+    - a przede wszystkim: gdy "Kod kres." wpadnie nad lub pod nagłówkiem "Lp",
+      przypisać go poprawnie do bieżącej pozycji (current).
+    """
     products = []
-    current = None
-    capture_name = False
-    name_lines = []
+    current = None         # słownik {'Lp':..., 'Name':..., 'Quantity':..., 'Barcode':...}
+    capture_name = False   # czy wciąż zbieramy fragmenty nazwy
+    name_lines = []        # lista pośrednia do składania nazwy
 
-    # Iterujemy po stronach
     for page in reader.pages:
-        # Podziel tekst na linie
         raw_lines = page.extract_text().split("\n")
 
-        # 1. Odetnij stopkę (np. „Strona X”)
+        # 1) Odcinamy stopkę: każda linia od momentu, gdy pojawi się słowo "Strona"
         footer_idx = None
         for i, ln in enumerate(raw_lines):
-            if "Strona" in ln:   # lub inny słownik stopki w Twoich PDF-ach
+            if "Strona" in ln:   # jeśli w stopce jest inne słowo-klucz, dopisz je tutaj
                 footer_idx = i
                 break
 
@@ -60,18 +30,36 @@ def parse_pdf_to_dataframe(reader: PyPDF2.PdfReader) -> pd.DataFrame:
         else:
             lines = raw_lines
 
-        # 2. Sprawdź, czy jest nagłówek „Lp” na tej stronie
-        if any(line.strip().startswith("Lp") for line in lines):
-            header_idx = next(i for i, line in enumerate(lines) if line.strip().startswith("Lp"))
+        # 2) Szukamy nagłówka "Lp" na bieżącej stronie (po odcięciu stopki)
+        header_idx = None
+        for i, ln in enumerate(lines):
+            if ln.strip().startswith("Lp"):
+                header_idx = i
+                break
+
+        # 3) Jeśli znaleźliśmy nagłówek, to najpierw przeszukujemy wszystki wiersze przed header_idx
+        #    tylko w kontekście szukania "Kod kres." dla ostatniego current.
+        if header_idx is not None:
+            # a) pętlą po wszystkich wierszach od 0 do header_idx-1:
+            for ln in lines[:header_idx]:
+                stripped = ln.strip()
+                if stripped.startswith("Kod kres."):
+                    parts = stripped.split(":", maxsplit=1)
+                    if len(parts) == 2 and current is not None:
+                        barcode = parts[1].strip()
+                        if current.get("Barcode") is None:
+                            current["Barcode"] = barcode
+            # b) Ustawiamy start_idx dopiero za headerem:
             start_idx = header_idx + 1
         else:
+            # Jeżeli na tej stronie nie ma powtórzonego nagłówka "Lp", to kontynuujemy od początku:
             start_idx = 0
 
-        # 3. Parsowanie linii od start_idx do końca (albo do stopki)
+        # 4) Dalej: parsowanie linii od start_idx do końca "lines"
         for i in range(start_idx, len(lines)):
             stripped = lines[i].strip()
 
-            # 3a) Kod kreskowy
+            # 4a) Jeżeli wiersz to "Kod kres.: XXXXX", przypiszemy go do current (jeśli jest puste)
             if stripped.startswith("Kod kres."):
                 parts = stripped.split(":", maxsplit=1)
                 if len(parts) == 2 and current is not None:
@@ -80,21 +68,21 @@ def parse_pdf_to_dataframe(reader: PyPDF2.PdfReader) -> pd.DataFrame:
                         current["Barcode"] = barcode
                 continue
 
-            # 3b) Czy to liczba? (może to być Lp lub Quantity)
+            # 4b) Jeżeli wiersz to wyłącznie liczba (np. "12", "150" itp.)
             if re.fullmatch(r"\d+", stripped):
-                # 3b-i) Jeśli następny wiersz to "szt." → Quantity
+                # 4b-i) Jeżeli kolejny wiersz to "szt.", to jest to ilość (Quantity)
                 if i + 1 < len(lines) and lines[i + 1].strip().lower() == "szt.":
                     qty = int(stripped)
                     if current is not None:
                         current["Quantity"] = qty
-                        # Sklej fragmenty nazwy
+                        # Sklejamy nazwę z fragmentów
                         full_name = " ".join(name_lines).strip()
                         current["Name"] = full_name
                         name_lines = []
                         capture_name = False
                     continue
                 else:
-                    # 3b-ii) To nowy Lp → zaczynamy nową pozycję
+                    # 4b-ii) W przeciwnym wypadku to nowy Lp → rozpoczynamy nową pozycję
                     lp_number = int(stripped)
                     current = {"Lp": lp_number, "Name": None, "Quantity": None, "Barcode": None}
                     products.append(current)
@@ -102,39 +90,17 @@ def parse_pdf_to_dataframe(reader: PyPDF2.PdfReader) -> pd.DataFrame:
                     name_lines = []
                     continue
 
-            # 3c) Jeżeli zbieramy nazwę (capture_name==True) i wiersz nie jest pusty
+            # 4c) Jeżeli capture_name=True i wiersz nie-pusty → składamy kolejne fragmenty nazwy
             if capture_name and stripped:
                 name_lines.append(stripped)
                 continue
 
-            # Pozostałe wiersze pomijamy
+            # Pozostałe wiersze (np. ceny, VAT, puste itp.) ignorujemy
 
-    # 4) Po przejrzeniu wszystkich stron filtrujemy puste/niekompletne wpisy
+        # Po zakończeniu bieżącej strony – kontynuujemy do następnej, z zachowaniem
+        # aktualnego `current`, `capture_name` i `name_lines`.
+
+    # 5) Po przejściu WSZYSTKICH stron budujemy DataFrame i filtrujemy niekompletne wiersze:
     df = pd.DataFrame(products)
     df = df.dropna(subset=["Name", "Quantity"]).reset_index(drop=True)
     return df
-
-# Wywołujemy parser
-with st.spinner("Analizuję PDF…"):
-    df = parse_pdf_to_dataframe(pdf_reader)
-
-# 5) Wyświetlamy tabelę w Streamlit
-st.subheader("Wyekstrahowane pozycje zamówienia")
-st.dataframe(df)  # pozwala scrollować wiersze/kolumny
-
-# 6) Dajmy opcję pobrania wyniku jako Excel
-def convert_df_to_excel(df_in: pd.DataFrame) -> bytes:
-    output = io.BytesIO()
-    # Używamy pandas i openpyxl, żeby zapisać w pamięci plik xlsx
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df_in.to_excel(writer, index=False, sheet_name="Zamowienie")
-    data = output.getvalue()
-    return data
-
-excel_data = convert_df_to_excel(df)
-st.download_button(
-    label="Pobierz wynik jako Excel",
-    data=excel_data,
-    file_name="parsed_zamowienie.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-)

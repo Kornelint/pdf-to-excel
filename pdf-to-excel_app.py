@@ -22,95 +22,79 @@ def parse_pdf_to_dataframe(reader: PyPDF2.PdfReader) -> pd.DataFrame:
     Parsuje PDF zamówienia w formacie PyPDF2.PdfReader i zwraca DataFrame z kolumnami:
     ['Lp', 'Name', 'Quantity', 'Barcode'].
 
-    - Odcina stopki (linie zawierające "Strona").
-    - Łapie wszystkie wystąpienia "Kod kres" w całym bloku tekstu, przypisując je do bieżącej pozycji.
-    - Scalanie bloków produktów rozbitych między stronami.
-    - Na końcu usuwa wiersze, które nie mają nazwy lub ilości.
+    Zasady:
+    1. Przechodzimy po kolejnych liniach wszystkich stron (bez stopki "Strona").
+    2. Jeśli linia zawiera wyłącznie liczbę, a następna linia to "szt.", to to jest ilość (Quantity).
+    3. Jeśli linia zawiera wyłącznie liczbę, a następna linia to nie "szt.", to to jest nowy Lp.
+    4. Jeśli linia zawiera frazę "Kod kres", to wyciągamy po niej kod i przypisujemy do bieżącej pozycji.
+    5. Wszystkie inne linie (fragmenty nazwy lub ceny czy VAT) traktujemy tak:
+       - Jeśli capture_name=True, a linia nie jest pusta i nie jest liczba, dopisujemy ją jako fragment nazwy.
+       - Jeśli linia jest pusta lub zawiera cenę czy VAT, pozycja nazwy się domyka dopiero, gdy natrafimy na ilość.
+    6. Na końcu odrzucamy wiersze bez Name lub bez Quantity.
     """
     products = []
     current = None
     capture_name = False
     name_lines = []
 
+    # Zbierz wszystkie linie (bez stopki "Strona …")
+    all_lines = []
     for page in reader.pages:
-        raw_lines = page.extract_text().split("\n")
-
-        # 1) Odetnij stopkę: wszystko od momentu, gdy pojawi się wiersz zawierający "Strona"
-        footer_idx = None
-        for i, ln in enumerate(raw_lines):
+        raw = page.extract_text().split("\n")
+        for ln in raw:
             if "Strona" in ln:
-                footer_idx = i
-                break
+                break  # ignorujemy wszystko od "Strona" dalej na tej stronie
+            all_lines.append(ln)
 
-        if footer_idx is not None:
-            lines = raw_lines[:footer_idx]
-        else:
-            lines = raw_lines
+    # Przechodzimy po wszystkich liniach w kolejności, jak w PDF-ie
+    i = 0
+    while i < len(all_lines):
+        ln = all_lines[i].strip()
 
-        # 2) Sprawdź, czy jest nagłówek "Lp" i zapamiętaj jego indeks
-        header_idx = None
-        for i, ln in enumerate(lines):
-            if ln.strip().startswith("Lp"):
-                header_idx = i
-                break
+        # 1) "Kod kres" w dowolnym miejscu linii?
+        if "Kod kres" in ln:
+            parts = ln.split(":", maxsplit=1)
+            if len(parts) == 2 and current is not None:
+                ean = parts[1].strip()
+                if not current.get("Barcode"):
+                    current["Barcode"] = ean
+            i += 1
+            continue
 
-        # 3) W całym bloku 'lines' znajdź wszystkie "Kod kres" i przypisz je do bieżącej pozycji
-        for ln in lines:
-            stripped = ln.strip()
-            if "Kod kres" in stripped:
-                parts = stripped.split(":", maxsplit=1)
-                if len(parts) == 2 and current is not None:
-                    candidate = parts[1].strip()
-                    if not current.get("Barcode"):  # przypisz, jeżeli jest puste
-                        current["Barcode"] = candidate
-
-        # 4) Ustal od którego wiersza (start_idx) zaczynamy parsować tabelę:
-        #    - jeśli header_idx istnieje, to start_idx = header_idx + 1
-        #    - jeśli nie, to from 0 (kontynuacja rozbitego bloku)
-        if header_idx is not None:
-            start_idx = header_idx + 1
-        else:
-            start_idx = 0
-
-        # 5) Od start_idx do końca 'lines' – normalne parsowanie Lp → nazwa → ilość:
-        for i in range(start_idx, len(lines)):
-            stripped = lines[i].strip()
-
-            # 5a) Jeśli linia zawiera "Kod kres", przeskoczemy, bo już to złapaliśmy w pętli wyżej
-            if "Kod kres" in stripped:
-                continue
-
-            # 5b) Jeżeli to sama liczba (może być Lp lub Quantity)
-            if re.fullmatch(r"\d+", stripped):
-                # 5b-i) Jeżeli następna linia to "szt.", traktujemy tę liczbę jako Quantity
-                if i + 1 < len(lines) and lines[i + 1].strip().lower() == "szt.":
-                    qty = int(stripped)
-                    if current is not None:
-                        current["Quantity"] = qty
-                        full_name = " ".join(name_lines).strip()
-                        current["Name"] = full_name
-                        name_lines = []
-                        capture_name = False
-                    continue
-                else:
-                    # 5b-ii) W przeciwnym razie to nowy Lp → tworzymy nowy słownik
-                    lp_number = int(stripped)
-                    current = {"Lp": lp_number, "Name": None, "Quantity": None, "Barcode": None}
-                    products.append(current)
-                    capture_name = True
+        # 2) Czy linia to sama liczba?
+        if re.fullmatch(r"\d+", ln):
+            # 2a) Jeżeli następna linia to "szt.", to traktujemy ln jako Quantity
+            if i + 1 < len(all_lines) and all_lines[i + 1].strip().lower() == "szt.":
+                qty = int(ln)
+                if current is not None:
+                    current["Quantity"] = qty
+                    # Po ilości znaczy: nazwa się kończy, scal fragmenty
+                    full_name = " ".join(name_lines).strip()
+                    current["Name"] = full_name
                     name_lines = []
-                    continue
-
-            # 5c) Jeśli capture_name=True i linia nie jest pusta → fragment nazwy produktu
-            if capture_name and stripped:
-                name_lines.append(stripped)
+                    capture_name = False
+                i += 2  # pomijamy także "szt."
+                continue
+            else:
+                # 2b) W przeciwnym wypadku ln to nowy Lp
+                Lp = int(ln)
+                current = {"Lp": Lp, "Name": None, "Quantity": None, "Barcode": None}
+                products.append(current)
+                capture_name = True
+                name_lines = []
+                i += 1
                 continue
 
-            # Pozostałe wiersze (np. ceny, VAT, puste) ignorujemy
+        # 3) Jeżeli capture_name=True i linia nie jest pusta → fragment nazwy
+        if capture_name and ln:
+            name_lines.append(ln)
+            i += 1
+            continue
 
-        # Koniec przetwarzania tej strony → przejdź dalej, zachowując bieżący 'current'
+        # 4) Wszelkie inne wiersze (np. puste, ceny, VAT) po prostu pomijamy
+        i += 1
 
-    # 6) Po przejściu wszystkich stron: stwórz DataFrame i odrzuć niekompletne wiersze
+    # 5) Po przetworzeniu wszystkich linii, utwórz DataFrame i przefiltruj
     df = pd.DataFrame(products)
     df = df.dropna(subset=["Name", "Quantity"]).reset_index(drop=True)
     return df

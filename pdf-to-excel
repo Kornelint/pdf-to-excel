@@ -1,111 +1,140 @@
-import re
+# app.py
+
+import streamlit as st
 import pandas as pd
+import re
 import PyPDF2
+import io
 
-# Ścieżka do Twojego PDF-a
-pdf_path = '/mnt/data/Zamówienie nr ZD 0175_05_25.pdf'
+st.set_page_config(page_title="PDF → Excel", layout="wide")
+st.title("Konwerter zamówienia PDF → Excel")
 
-# Wczytanie PDF-a
-reader = PyPDF2.PdfReader(pdf_path)
+st.markdown(
+    """
+    Ten prosty demo-aplikacja Streamlit pozwala wczytać plik PDF 
+    (zamówienie, gdzie każda pozycja rozbita jest na kilka wierszy) i 
+    wyeksportować go do Excela.  
+    Plik musi zawierać nagłówek „Lp” oraz wiersze w układzie:  
+    - numer pozycji (liczba)  
+    - fragmenty nazwy (może być 2–3 wiersze)  
+    - ilość (liczba) i wiersz „szt.”  
+    - na końcu blok z „Kod kres.: XXXXXXXX”  
+    """
+)
 
-# Lista słowników z danymi każdej pozycji
-products = []
+# 1) Użytkownik wrzuca PDF
+uploaded_file = st.file_uploader("Wybierz plik PDF ze zamówieniem", type=["pdf"])
+if uploaded_file is None:
+    st.info("Proszę wgrać plik PDF, aby uruchomić parser.")
+    st.stop()
 
-# Zmienne pomocnicze, które będziemy przenosić między stronami
-current = None          # słownik dla bieżącej pozycji (Lp, Name, Quantity, Barcode)
-capture_name = False    # flaga: czy wciąż zbieramy fragmenty nazwy dla current
-name_lines = []         # lista wierszy-nazwa, które zbieramy dopóki nie napotkamy ilości
+# 2) Gdy użytkownik wrzuci plik, odczytujemy jego zawartość
+try:
+    # PyPDF2 oczekuje pliku "readable()" → dlatego wyciągamy bajty
+    pdf_reader = PyPDF2.PdfReader(uploaded_file)
+except Exception as e:
+    st.error(f"Nie udało się wczytać PDF-a: {e}")
+    st.stop()
 
-for page_idx, page in enumerate(reader.pages):
-    # 1) Ekstrakcja tekstu i rozbicie na linie
-    raw_lines = page.extract_text().split('\n')
+# 3) Funkcja, która na podstawie wczytanych stron tworzy DataFrame
+def parse_pdf_to_dataframe(reader: PyPDF2.PdfReader) -> pd.DataFrame:
+    products = []
+    current = None
+    capture_name = False
+    name_lines = []
 
-    # 2) Jeśli tej stronie towarzyszy stopka (np. zawiera "Strona"), obetnijmy wszystko od stopki w dół
-    #    dzięki temu nie będziemy parsować numerów stron ani tekstu "Wydrukowano..."
-    footer_start = None
-    for i, ln in enumerate(raw_lines):
-        if "Strona" in ln:  # lub ln.startswith("Strona"), w zależności od PDF
-            footer_start = i
-            break
+    # Iterujemy po stronach
+    for page in reader.pages:
+        # Podziel tekst na linie
+        raw_lines = page.extract_text().split("\n")
 
-    if footer_start is not None:
-        lines = raw_lines[:footer_start]
-    else:
-        lines = raw_lines
+        # 1. Odetnij stopkę (np. „Strona X”)
+        footer_idx = None
+        for i, ln in enumerate(raw_lines):
+            if "Strona" in ln:   # lub inny słownik stopki w Twoich PDF-ach
+                footer_idx = i
+                break
 
-    # 3) Sprawdźmy, czy na tej stronie pojawia się w ogóle nagłówek "Lp"
-    #    Jeśli tak, to ustawiamy start_idx tuż za "Lp". Jeśli nie, startujemy od 0
-    if any(line.strip().startswith("Lp") for line in lines):
-        header_idx = next(i for i, line in enumerate(lines) if line.strip().startswith("Lp"))
-        start_idx = header_idx + 1
-    else:
-        # Jeżeli kontynuujemy pozycję z poprzedniej strony, to analizujemy od początku
-        start_idx = 0
+        if footer_idx is not None:
+            lines = raw_lines[:footer_idx]
+        else:
+            lines = raw_lines
 
-    # 4) Przechodzimy po wszystkich liniach użytecznych (bez stopki)
-    for i in range(start_idx, len(lines)):
-        stripped = lines[i].strip()
+        # 2. Sprawdź, czy jest nagłówek „Lp” na tej stronie
+        if any(line.strip().startswith("Lp") for line in lines):
+            header_idx = next(i for i, line in enumerate(lines) if line.strip().startswith("Lp"))
+            start_idx = header_idx + 1
+        else:
+            start_idx = 0
 
-        # 4a) Jeżeli wiersz zaczyna się od "Kod kres.:" → wyciągamy kod kreskowy i przypisujemy go do bieżącej pozycji
-        if stripped.startswith("Kod kres."):
-            # np. "Kod kres.: 5029040013097"
-            parts = stripped.split(":", maxsplit=1)
-            if len(parts) == 2 and current is not None:
-                barcode = parts[1].strip()
-                # Jeżeli jeszcze nie mieliśmy kodu, to przypisz
-                if current.get('Barcode') is None:
-                    current['Barcode'] = barcode
-            continue
+        # 3. Parsowanie linii od start_idx do końca (albo do stopki)
+        for i in range(start_idx, len(lines)):
+            stripped = lines[i].strip()
 
-        # 4b) Jeżeli to linia z samą liczbą (np. "8" albo "36") → może to być Lp lub ilość
-        if re.fullmatch(r"\d+", stripped):
-            # 4b-i) Jeżeli następny wiersz to "szt." → traktujemy tę liczbę jako Quantity
-            if i + 1 < len(lines) and lines[i + 1].strip().lower() == "szt.":
-                qty = int(stripped)
-                if current is not None:
-                    current['Quantity'] = qty
-                    # Sklejemy wszystkie składowe name_lines w jeden pełny opis nazwy
-                    full_name = " ".join(name_lines).strip()
-                    current['Name'] = full_name
-                    # Po przydzieleniu nazwy i ilości – wyczyśćmy name_lines i zakończmy zbieranie nazwy
+            # 3a) Kod kreskowy
+            if stripped.startswith("Kod kres."):
+                parts = stripped.split(":", maxsplit=1)
+                if len(parts) == 2 and current is not None:
+                    barcode = parts[1].strip()
+                    if current.get("Barcode") is None:
+                        current["Barcode"] = barcode
+                continue
+
+            # 3b) Czy to liczba? (może to być Lp lub Quantity)
+            if re.fullmatch(r"\d+", stripped):
+                # 3b-i) Jeśli następny wiersz to "szt." → Quantity
+                if i + 1 < len(lines) and lines[i + 1].strip().lower() == "szt.":
+                    qty = int(stripped)
+                    if current is not None:
+                        current["Quantity"] = qty
+                        # Sklej fragmenty nazwy
+                        full_name = " ".join(name_lines).strip()
+                        current["Name"] = full_name
+                        name_lines = []
+                        capture_name = False
+                    continue
+                else:
+                    # 3b-ii) To nowy Lp → zaczynamy nową pozycję
+                    lp_number = int(stripped)
+                    current = {"Lp": lp_number, "Name": None, "Quantity": None, "Barcode": None}
+                    products.append(current)
+                    capture_name = True
                     name_lines = []
-                    capture_name = False
-                continue
-            else:
-                # 4b-ii) To musi być początek nowej pozycji (Lp = numer pozycji w zamówieniu)
-                lp_number = int(stripped)
-                # Utworzymy nową pozycję
-                current = {
-                    'Lp': lp_number,
-                    'Name': None,
-                    'Quantity': None,
-                    'Barcode': None
-                }
-                products.append(current)
-                # Włączamy zbieranie nazwy, która będzie w kolejnych wierszach
-                capture_name = True
-                name_lines = []
+                    continue
+
+            # 3c) Jeżeli zbieramy nazwę (capture_name==True) i wiersz nie jest pusty
+            if capture_name and stripped:
+                name_lines.append(stripped)
                 continue
 
-        # 4c) Jeżeli capture_name=True i linia nie jest pusta → to fragment nazwy produktu
-        if capture_name and stripped:
-            name_lines.append(stripped)
-            continue
+            # Pozostałe wiersze pomijamy
 
-        # *** Każda inna linia (np. ceny, VAT, puste wiersze) pomijamy ***
+    # 4) Po przejrzeniu wszystkich stron filtrujemy puste/niekompletne wpisy
+    df = pd.DataFrame(products)
+    df = df.dropna(subset=["Name", "Quantity"]).reset_index(drop=True)
+    return df
 
-    # Koniec pętli po wierszach aktualnej strony → przechodzimy do kolejnej strony,
-    # ale nie resetujemy `current`, `capture_name` ani `name_lines`.
-    # Dzięki temu jeśli np. numer Lp i fragment nazwy były na dole strony 1,
-    # a ilość i kod kreskowy – na początku strony 2, to dokończymy „current” na stronie 2.
+# Wywołujemy parser
+with st.spinner("Analizuję PDF…"):
+    df = parse_pdf_to_dataframe(pdf_reader)
 
-# 5) Po przejściu wszystkich stron mając listę słowników `products`, jeszcze odfiltrujmy
-#    te pozycje, które nie mają nazwy lub nie mają ilości (czyli nie są pełnymi produktami).
-df = pd.DataFrame(products)
-df = df.dropna(subset=['Name', 'Quantity']).reset_index(drop=True)
+# 5) Wyświetlamy tabelę w Streamlit
+st.subheader("Wyekstrahowane pozycje zamówienia")
+st.dataframe(df)  # pozwala scrollować wiersze/kolumny
 
-# Teraz df ma kolumny: ['Lp', 'Name', 'Quantity', 'Barcode']
-# i powinno zawierać wszystkich 31 produktów (bez pustych wierszy czy nagłówków/stopki).
+# 6) Dajmy opcję pobrania wyniku jako Excel
+def convert_df_to_excel(df_in: pd.DataFrame) -> bytes:
+    output = io.BytesIO()
+    # Używamy pandas i openpyxl, żeby zapisać w pamięci plik xlsx
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df_in.to_excel(writer, index=False, sheet_name="Zamowienie")
+    data = output.getvalue()
+    return data
 
-# Aby zobaczyć wynik:
-print(df)
+excel_data = convert_df_to_excel(df)
+st.download_button(
+    label="Pobierz wynik jako Excel",
+    data=excel_data,
+    file_name="parsed_zamowienie.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)

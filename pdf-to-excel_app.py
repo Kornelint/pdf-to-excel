@@ -8,7 +8,8 @@ import io
 
 st.set_page_config(page_title="PDF → Excel", layout="wide")
 st.title("Konwerter zamówienia PDF → Excel")
-'''
+
+"""
 st.markdown(
     """
     Wgraj plik PDF ze zamówieniem. Aplikacja:
@@ -33,7 +34,7 @@ st.markdown(
        oraz umożliwi pobranie pliku Excel, zawierającego te cztery kolumny.
     """
 )
-'''
+"""
 
 def parse_pdf_generic(reader: PyPDF2.PdfReader) -> pd.DataFrame:
     """

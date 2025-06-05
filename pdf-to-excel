@@ -1,0 +1,111 @@
+import re
+import pandas as pd
+import PyPDF2
+
+# Ścieżka do Twojego PDF-a
+pdf_path = '/mnt/data/Zamówienie nr ZD 0175_05_25.pdf'
+
+# Wczytanie PDF-a
+reader = PyPDF2.PdfReader(pdf_path)
+
+# Lista słowników z danymi każdej pozycji
+products = []
+
+# Zmienne pomocnicze, które będziemy przenosić między stronami
+current = None          # słownik dla bieżącej pozycji (Lp, Name, Quantity, Barcode)
+capture_name = False    # flaga: czy wciąż zbieramy fragmenty nazwy dla current
+name_lines = []         # lista wierszy-nazwa, które zbieramy dopóki nie napotkamy ilości
+
+for page_idx, page in enumerate(reader.pages):
+    # 1) Ekstrakcja tekstu i rozbicie na linie
+    raw_lines = page.extract_text().split('\n')
+
+    # 2) Jeśli tej stronie towarzyszy stopka (np. zawiera "Strona"), obetnijmy wszystko od stopki w dół
+    #    dzięki temu nie będziemy parsować numerów stron ani tekstu "Wydrukowano..."
+    footer_start = None
+    for i, ln in enumerate(raw_lines):
+        if "Strona" in ln:  # lub ln.startswith("Strona"), w zależności od PDF
+            footer_start = i
+            break
+
+    if footer_start is not None:
+        lines = raw_lines[:footer_start]
+    else:
+        lines = raw_lines
+
+    # 3) Sprawdźmy, czy na tej stronie pojawia się w ogóle nagłówek "Lp"
+    #    Jeśli tak, to ustawiamy start_idx tuż za "Lp". Jeśli nie, startujemy od 0
+    if any(line.strip().startswith("Lp") for line in lines):
+        header_idx = next(i for i, line in enumerate(lines) if line.strip().startswith("Lp"))
+        start_idx = header_idx + 1
+    else:
+        # Jeżeli kontynuujemy pozycję z poprzedniej strony, to analizujemy od początku
+        start_idx = 0
+
+    # 4) Przechodzimy po wszystkich liniach użytecznych (bez stopki)
+    for i in range(start_idx, len(lines)):
+        stripped = lines[i].strip()
+
+        # 4a) Jeżeli wiersz zaczyna się od "Kod kres.:" → wyciągamy kod kreskowy i przypisujemy go do bieżącej pozycji
+        if stripped.startswith("Kod kres."):
+            # np. "Kod kres.: 5029040013097"
+            parts = stripped.split(":", maxsplit=1)
+            if len(parts) == 2 and current is not None:
+                barcode = parts[1].strip()
+                # Jeżeli jeszcze nie mieliśmy kodu, to przypisz
+                if current.get('Barcode') is None:
+                    current['Barcode'] = barcode
+            continue
+
+        # 4b) Jeżeli to linia z samą liczbą (np. "8" albo "36") → może to być Lp lub ilość
+        if re.fullmatch(r"\d+", stripped):
+            # 4b-i) Jeżeli następny wiersz to "szt." → traktujemy tę liczbę jako Quantity
+            if i + 1 < len(lines) and lines[i + 1].strip().lower() == "szt.":
+                qty = int(stripped)
+                if current is not None:
+                    current['Quantity'] = qty
+                    # Sklejemy wszystkie składowe name_lines w jeden pełny opis nazwy
+                    full_name = " ".join(name_lines).strip()
+                    current['Name'] = full_name
+                    # Po przydzieleniu nazwy i ilości – wyczyśćmy name_lines i zakończmy zbieranie nazwy
+                    name_lines = []
+                    capture_name = False
+                continue
+            else:
+                # 4b-ii) To musi być początek nowej pozycji (Lp = numer pozycji w zamówieniu)
+                lp_number = int(stripped)
+                # Utworzymy nową pozycję
+                current = {
+                    'Lp': lp_number,
+                    'Name': None,
+                    'Quantity': None,
+                    'Barcode': None
+                }
+                products.append(current)
+                # Włączamy zbieranie nazwy, która będzie w kolejnych wierszach
+                capture_name = True
+                name_lines = []
+                continue
+
+        # 4c) Jeżeli capture_name=True i linia nie jest pusta → to fragment nazwy produktu
+        if capture_name and stripped:
+            name_lines.append(stripped)
+            continue
+
+        # *** Każda inna linia (np. ceny, VAT, puste wiersze) pomijamy ***
+
+    # Koniec pętli po wierszach aktualnej strony → przechodzimy do kolejnej strony,
+    # ale nie resetujemy `current`, `capture_name` ani `name_lines`.
+    # Dzięki temu jeśli np. numer Lp i fragment nazwy były na dole strony 1,
+    # a ilość i kod kreskowy – na początku strony 2, to dokończymy „current” na stronie 2.
+
+# 5) Po przejściu wszystkich stron mając listę słowników `products`, jeszcze odfiltrujmy
+#    te pozycje, które nie mają nazwy lub nie mają ilości (czyli nie są pełnymi produktami).
+df = pd.DataFrame(products)
+df = df.dropna(subset=['Name', 'Quantity']).reset_index(drop=True)
+
+# Teraz df ma kolumny: ['Lp', 'Name', 'Quantity', 'Barcode']
+# i powinno zawierać wszystkich 31 produktów (bez pustych wierszy czy nagłówków/stopki).
+
+# Aby zobaczyć wynik:
+print(df)

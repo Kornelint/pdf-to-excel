@@ -7,30 +7,31 @@ import io
 st.set_page_config(page_title="PDF → Excel", layout="wide")
 st.title("Konwerter zamówienia PDF → Excel")
 
-st.markdown(
-    """
-    Wgraj plik PDF ze zamówieniem. Aplikacja:
-    1. Połączy wszystkie strony w jeden ciąg wierszy, pomijając:
-       - Stopki (linie zaczynające się od "Strona", "Wydrukowano" lub zawierające "ZD <numer>"),
-       - Powtarzające się nagłówki tabeli: każdą linię zaczynającą się od "Lp" (niebędącą czystą liczbą),
-         każdą linię zaczynającą się od "Nazwa towaru", oraz wiersze: "Ilość", "J. miary", "Cena", "Wartość",
-         "netto", "brutto", "Indeks katalogowy".
-    2. Na scalonym ciągu (`all_lines`):
-       - Zidentyfikuje wszystkie pozycje Lp – każdą linię, która jest czystą liczbą, a w kolejnej linii pojawiają się litery 
-         (i ta kolejna linia nie jest "szt." ani wierszem ceny ani "Kod kres").  
-       - Zlokalizuje wszystkie linie „Kod kres.: <EAN>” i utworzy listę indeksów `idx_ean`.
-       - Podzieli `all_lines` na „interwały” oddzielone pozycjami Lp. Dla każdej pozycji Lp weźmie dokładnie te linie, 
-         które między nią a następną pozycją Lp się znajdują. W tej grupie:
-         • znajdzie tzw. `qty_idx` (pierwszą linię będącą czystą liczbą, której kolejna linia to "szt.") → to jest `Ilość`,  
-         • zbierze fragmenty nazwy – wszystkie wiersze zawierające litery (nie wyglądające jak cena, nie zaczynające się od “VAT”, nie będące “/”, 
-           nie zaczynające się od “ARA” ani “KAT”), zarówno _przed_ jak i _po_ kolumnie ilości/ceny, aż do momentu napotkania linii “Kod kres”.  
-         • spośród `idx_ean` wybierze ten indeks `e` (jeśli istnieje), który leży w przedziale `(poprzednie_Lp, następne_Lp)` i jest największy (czyli EAN dla tej pozycji).  
-       • Sklei pełną nazwę, ustawi `Ilość`, pobierze `Symbol`.  
-    3. Wyświetli wynik jako tabelę z kolumnami:
-       `Lp`, `Name`, `Ilość`, `Symbol`  
-       oraz umożliwi pobranie pliku Excel, zawierającego te cztery kolumny.
-    """
-)
+#st.markdown(
+ #   """
+  #  Wgraj plik PDF ze zamówieniem. Aplikacja:
+   # 1. Połączy wszystkie strony w jeden ciąg wierszy, pomijając:
+    #   - Stopki (linie zaczynające się od "Strona", "Wydrukowano" lub zawierające "ZD <numer>"),
+     #  - Powtarzające się nagłówki tabeli: każdą linię zaczynającą się od "Lp" (niebędącą czystą liczbą),
+      #   każdą linię zaczynającą się od "Nazwa towaru", oraz wiersze: "Ilość", "J. miary", "Cena", "Wartość",
+       #  "netto", "brutto", "Indeks katalogowy".
+  #  2. Na scalonym ciągu (`all_lines`):
+   #    - Zidentyfikuje wszystkie pozycje Lp – każdą linię, która jest czystą liczbą, a w kolejnej linii pojawiają się litery 
+    #     (i ta kolejna linia nie jest "szt." ani wierszem ceny ani "Kod kres").  
+     #  - Zlokalizuje wszystkie linie „Kod kres.: <EAN>” i utworzy listę indeksów `idx_ean`.
+      # - Podzieli `all_lines` na „interwały” oddzielone pozycjami Lp. Dla każdej pozycji Lp weźmie dokładnie te linie, 
+       #  które między nią a następną pozycją Lp się znajdują. W tej grupie:
+        # • znajdzie tzw. `qty_idx` (pierwszą linię będącą czystą liczbą, której kolejna linia to "szt.") → to jest `Ilość`,  
+   #      • zbierze fragmenty nazwy – wszystkie wiersze zawierające litery (nie wyglądające jak cena, nie zaczynające się od “VAT”, nie będące “/”, 
+    #       nie zaczynające się od “ARA” ani “KAT”), zarówno _przed_ jak i _po_ kolumnie ilości/ceny, aż do momentu napotkania linii “Kod kres”.  
+     #    • spośród `idx_ean` wybierze ten indeks `e` (jeśli istnieje), który leży w przedziale `(poprzednie_Lp, następne_Lp)` i jest największy (czyli EAN dla tej pozycji).  
+      # • Sklei pełną nazwę, ustawi `Ilość`, pobierze `Symbol`.  
+   
+# 3. Wyświetli wynik jako tabelę z kolumnami:
+ #      `Lp`, `Name`, `Ilość`, `Symbol`  
+  #     oraz umożliwi pobranie pliku Excel, zawierającego te cztery kolumny.
+   # """
+#)
 
 
 def parse_pdf_generic(reader: PyPDF2.PdfReader) -> pd.DataFrame:

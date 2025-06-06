@@ -4,6 +4,10 @@ import re
 import PyPDF2
 import io
 
+# Dodajemy biblioteki potrzebne do OCR
+from pdf2image import convert_from_bytes
+import pytesseract
+
 st.set_page_config(page_title="PDF → Excel", layout="wide")
 st.title("PDF → Excel")
 
@@ -11,9 +15,9 @@ st.markdown(
     """
     Wgraj plik PDF ze zamówieniem. Aplikacja:
     1. Próbuje wyciągnąć tekst przez PyPDF2.
-    2. Jeśli nie znajdzie ani jednej niepustej linii (zbyt „zaszyfrowany” PDF/obraz),
-       wyświetli komunikat, że wymagana jest warstwa tekstu (OCR).
-    3. Gdy już mamy listę wierszy (`all_lines`), wykrywamy układ:
+    2. Jeśli nie znajdzie ani jednej niepustej linii lub nie uda się wyekstrahować EAN-ów,
+       wykonuje OCR (pytesseract + pdf2image) i próbuje ponownie.
+    3. Gdy mamy listę wierszy (`all_lines`), wykrywamy układ:
        - **Układ D**: proste linie zawierające tylko EAN i ilość, np.
          `5029040012366 Nazwa Produktu 96,00 szt.` lub `5029040012366 96,00 szt.`
        - **Układ B**: jedna pozycja w jednym wierszu, np.
@@ -39,6 +43,29 @@ def extract_text_with_pypdf2(pdf_bytes: bytes) -> list[str]:
     lines = []
     for page in reader.pages:
         text = page.extract_text() or ""
+        for ln in text.split("\n"):
+            stripped = ln.strip()
+            if stripped:
+                lines.append(stripped)
+    return lines
+
+
+def extract_text_with_ocr(pdf_bytes: bytes) -> list[str]:
+    """
+    Wykonuje OCR na każdej stronie PDF-a (pdf2image + pytesseract)
+    i zwraca listę niepustych linii.
+    Uwaga: wymaga zainstalowanego poppler i Tesseract OCR.
+    """
+    lines = []
+    try:
+        # Konwertuj PDF na obrazy (rozmiar można dostosować przez dpi)
+        pages = convert_from_bytes(pdf_bytes, dpi=300)
+    except Exception:
+        return []
+
+    for img in pages:
+        # OCR każdej strony
+        text = pytesseract.image_to_string(img, lang="pol")  # jeśli zamówienie po polsku
         for ln in text.split("\n"):
             stripped = ln.strip()
             if stripped:
@@ -105,12 +132,6 @@ def parse_layout_b(all_lines: list[str]) -> pd.DataFrame:
 def parse_layout_c(all_lines: list[str]) -> pd.DataFrame:
     """
     Parser dla układu C – czysty 13-cyfrowy EAN w osobnej linii, potem Lp, potem Name, potem "szt." i Quantity.
-    Logika:
-      1) Znajdź indeksy wszystkich Lp: linie z samą liczbą, pod którymi jest fragment nazwy.
-      2) Znajdź indeksy czystych 13-cyfrowych EAN-ów.
-      3) Dla każdego Lp przypisz EAN z maksymalnego indeksu < lp_idx.
-      4) Name = all_lines[lp_idx + 1].
-      5) Quantity = integer dwie linie po napotkaniu "szt.".
     """
     idx_lp = []
     for i in range(len(all_lines) - 1):
@@ -237,28 +258,37 @@ pdf_bytes = uploaded_file.read()
 # 3) Ekstrakcja tekstu przez PyPDF2
 all_lines = extract_text_with_pypdf2(pdf_bytes)
 
-# 4) Jeśli nadal brak linii → komunikat i zakończ (konieczny OCR zewnętrzny)
+# 4) Sprawdź, czy udało się znaleźć jakiekolwiek linie zawierające 13-cyfrowe EAN-y.
+ean_pattern = re.compile(r"\b\d{13}\b")
+found_ean = any(ean_pattern.search(ln) for ln in all_lines)
+
+# 5) Jeśli brak linii lub brak wykrycia EAN-ów → wykonaj OCR
+if not all_lines or not found_ean:
+    st.info("Nie wykryto tekstu (lub EAN-ów) przy pomocy PyPDF2. Próbuję OCR...")
+    all_lines = extract_text_with_ocr(pdf_bytes)
+
+# 6) Jeśli nadal brak linii → komunikat i zakończ (konieczny OCR zewnętrzny/nieczytelny PDF)
 if not all_lines:
     st.error(
-        "Nie udało się wyciągnąć tekstu z tego PDF-a. "
-        "Prawdopodobnie wymaga OCR lub ma niestandardową warstwę czcionek. "
+        "Nie udało się wyciągnąć tekstu z tego PDF-a ani przez PyPDF2, ani przez OCR. "
+        "Prawdopodobnie wymaga niestandardowego OCR. "
         "Najpierw wykonaj OCR (np. Tesseract, Adobe OCR), a potem wgraj nowy plik."
     )
     st.stop()
 
-# 5) Wykryj układ D – EAN + ilość w tej samej linii, bez Lp
+# 7) Wykryj układ D – EAN + ilość w tej samej linii, bez Lp
 pattern_d = re.compile(r"^\d{13}(?:\s+.*?)*\s+\d{1,3},\d{2}\s+szt", flags=re.IGNORECASE)
 is_layout_d = any(pattern_d.match(ln) for ln in all_lines)
 
-# 6) Wykryj układ B (Lp + EAN w jednej linii)
+# 8) Wykryj układ B (Lp + EAN w jednej linii)
 pattern_b = re.compile(r"^\d+\s+\d{13}\s+.+\s+\d{1,3},\d{2}\s+szt", flags=re.IGNORECASE)
 is_layout_b = any(pattern_b.match(ln) for ln in all_lines)
 
-# 7) Wykryj układ C (czysty 13-cyfrowy EAN w linii, ale nie układ B ani D)
+# 9) Wykryj układ C (czysty 13-cyfrowy EAN w linii, ale nie układ B ani D)
 has_pure_ean = any(re.fullmatch(r"\d{13}", ln) for ln in all_lines)
 is_layout_c = has_pure_ean and not is_layout_b and not is_layout_d
 
-# 8) Parsuj w zależności od układu
+# 10) Parsuj w zależności od układu
 if is_layout_d:
     df = parse_layout_d(all_lines)
 elif is_layout_b:
@@ -268,15 +298,24 @@ elif is_layout_c:
 else:
     df = parse_layout_a(all_lines)
 
-# 9) Odfiltruj wiersze bez nazwy lub ilości (jeśli kolumny istnieją)
+# 11) Odfiltruj wiersze bez nazwy lub ilości (jeśli kolumny istnieją)
 if "Name" in df.columns and "Quantity" in df.columns:
     df = df.dropna(subset=["Quantity"]).reset_index(drop=True)
 
-# 10) Wyświetl w Streamlit
+# 12) Sprawdź, czy po parsowaniu wydobyto cokolwiek
+if df.empty:
+    st.error(
+        "Po parsowaniu nie znaleziono pozycji zamówienia. "
+        "Upewnij się, że PDF zawiera kody EAN oraz ilości w formacie rozpoznawalnym przez parser. "
+        "Możliwe, że odpowiada inny układ – w takim przypadku sprawdź wzorce lub dostosuj parser."
+    )
+    st.stop()
+
+# 13) Wyświetl w Streamlit
 st.subheader("Wyekstrahowane pozycje zamówienia")
 st.dataframe(df, use_container_width=True)
 
-# 11) Przycisk do pobrania pliku Excel
+# 14) Przycisk do pobrania pliku Excel
 def convert_df_to_excel(df_in: pd.DataFrame) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:

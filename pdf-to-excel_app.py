@@ -3,12 +3,8 @@
 import streamlit as st
 import pandas as pd
 import re
-import fitz  # PyMuPDF
 import PyPDF2
 import io
-import subprocess
-import tempfile
-import os
 
 st.set_page_config(page_title="PDF → Excel", layout="wide")
 st.title("PDF → Excel")
@@ -16,46 +12,24 @@ st.title("PDF → Excel")
 st.markdown(
     """
     Wgraj plik PDF ze zamówieniem. Aplikacja:
-    1. Próbuje wyciągnąć tekst przez PyMuPDF (fitz).  
-       Jeśli nie znajdzie ani jednej czytelnej linii, próbuje PyPDF2.  
-       Jeśli dalej nic nie ma – przeprowadza OCR przez `pdftoppm` + `tesseract`.  
-    2. Mając listę wierszy tekstu (`all_lines`), wykrywa układ:
-       - **Układ B**: każda pozycja w jednej linii (np. 
-         `1 5029040012366 Nazwa Produktu 96,00 szt.`).  
-       - **Układ C**: EAN w osobnej linii (tylko 13 cyfr), potem `Lp`, potem `Name`, itd.  
-       - **Układ A**: „Kod kres.: <EAN>” w osobnej linii, Lp w osobnej linii (czysta liczba), 
+    1. Próbuję odczytać tekst przez PyPDF2.
+    2. Jeśli nie znajdę ani jednej czytelnej linii, wyświetlam informację, że trzeba najpierw wykonać OCR.
+    3. Gdy mam listę wierszy (`all_lines`), wykrywam układ:
+       - **Układ B**: każda pozycja w jednej linii, np.  
+         `1 5029040012366 Nazwa Produktu 96,00 szt.`  
+       - **Układ C**: czysty 13-cyfrowy EAN w osobnej linii, potem Lp itp.  
+       - **Układ A**: „Kod kres.: <EAN>” w oddzielnej linii, Lp w oddzielnej linii (czysta liczba),  
          fragmenty nazwy przed i po kolumnie cen.  
-    3. W zależności od wykrytego układu wywołuje odpowiedni parser (A, B lub C).  
-    4. Wyświetla tabelę z kolumnami: `Lp`, `Name`, `Quantity`, `Barcode`.  
-    5. Umożliwia pobranie wynikowego pliku Excel.
+    4. Wyświetlam tabelę z kolumnami `Lp`, `Name`, `Quantity`, `Barcode` i pozwalam pobrać Excel.
     """
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
 
-def extract_text_with_fitz(pdf_bytes: bytes) -> list[str]:
-    """
-    Próba wyciągnięcia tekstu każdej strony przez PyMuPDF (fitz).
-    Zwraca listę niepustych wierszy. Jeśli niczego nie znajdzie, zwraca [].
-    """
-    try:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    except Exception:
-        return []
-    lines = []
-    for page in doc:
-        text = page.get_text() or ""
-        for ln in text.split("\n"):
-            stripped = ln.strip()
-            if stripped:
-                lines.append(stripped)
-    return lines
-
-
 def extract_text_with_pypdf2(pdf_bytes: bytes) -> list[str]:
     """
-    Próba wyciągnięcia tekstu każdej strony przez PyPDF2.
-    Zwraca listę niepustych wierszy. Jeśli niczego nie znajdzie, zwraca [].
+    Wyciąga wszystkie niepuste linie tekstu przez PyPDF2.
+    Zwraca listę wierszy; jeśli pusta, oznacza brak czytelnego tekstu.
     """
     try:
         reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
@@ -71,68 +45,10 @@ def extract_text_with_pypdf2(pdf_bytes: bytes) -> list[str]:
     return lines
 
 
-def ocr_pdf_to_lines(pdf_bytes: bytes) -> list[str]:
-    """
-    Jeśli PDF nie zawiera osadzonego tekstu, wykonaj OCR:
-    1) Zapisz bajty do pliku tymczasowego.
-    2) Użyj `pdftoppm` (poppler-utils) do wygenerowania PNG stron.
-    3) Na każdym PNG uruchom `tesseract ... stdout -l pol`, by pozyskać tekst.
-    4) Zwróć listę niepustych wierszy.
-    """
-    lines = []
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp_pdf = os.path.join(tmpdir, "temp.pdf")
-        with open(tmp_pdf, "wb") as f:
-            f.write(pdf_bytes)
-        # Konwertuj każdą stronę PDF na PNG: page-1.png, page-2.png, ...
-        cmd = ["pdftoppm", "-png", "-r", "300", tmp_pdf, os.path.join(tmpdir, "page")]
-        try:
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            return []
-        idx = 1
-        while True:
-            img_path = os.path.join(tmpdir, f"page-{idx}.png")
-            if not os.path.exists(img_path):
-                break
-            try:
-                result = subprocess.run(
-                    ["tesseract", img_path, "stdout", "-l", "pol"],
-                    capture_output=True, check=True
-                )
-                text = result.stdout.decode("utf-8", errors="ignore")
-            except Exception:
-                text = ""
-            for ln in text.split("\n"):
-                stripped = ln.strip()
-                if stripped:
-                    lines.append(stripped)
-            idx += 1
-    return lines
-
-
-def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> list[str]:
-    """
-    Łączy wszystkie podejścia:
-    1) Najpierw PyMuPDF (fitz),
-    2) potem PyPDF2,
-    3) i w końcu OCR (pdftoppm + tesseract).
-    Jeśli wciąż brak linii, zwraca [].
-    """
-    lines = extract_text_with_fitz(pdf_bytes)
-    if lines:
-        return lines
-    lines = extract_text_with_pypdf2(pdf_bytes)
-    if lines:
-        return lines
-    return ocr_pdf_to_lines(pdf_bytes)
-
-
 def parse_layout_b(all_lines: list[str]) -> pd.DataFrame:
     """
-    Parser dla układu B: każda pozycja w jednej linii, np.
-    1 5029040012366 Nazwa Produktu 96,00 szt. ...
-    -> wyciągamy Lp (grupa 1), Barcode (grupa 2), Name (grupa 3), Quantity (grupa 4).
+    Parser dla rożkładu B – każda pozycja w jednej linii:
+      <Lp> <EAN(13)> <pełna nazwa> <ilość>,<xx> szt ...
     """
     products = []
     pattern = re.compile(
@@ -157,20 +73,9 @@ def parse_layout_b(all_lines: list[str]) -> pd.DataFrame:
 
 def parse_layout_c(all_lines: list[str]) -> pd.DataFrame:
     """
-    Parser dla układu C: EAN w osobnej linii (13 cyfr),
-    potem Lp, potem Name, potem "ilość" w następującej strukturze:
-      <EAN (13-digit)>
-      <Lp>               <-- pure integer
-      <Name>
-      <Price>
-      "szt."
-      <VAT or 0,00>
-      <Quantity>         <-- pure integer
-      ...
-    Mapujemy każdy Lp do EAN najbliższego powyżej (e_idx < lp_idx).
-    Name to linia bezpośrednio po Lp. Quantity to the integer two lines after "szt.".
+    Parser dla układu C – czysty 13-cyfrowy EAN w oddzielnej linii, potem Lp, potem Name, potem "szt." i Quantity.
     """
-    # 1) Znajdź indeksy Lp (linia czysta-liczba, pod nią coś z literami)
+    # 1) Znajdź indeksy Lp – czysta liczba, pod którą jest tekst
     idx_lp = []
     for i in range(len(all_lines) - 1):
         if re.fullmatch(r"\d+", all_lines[i]):
@@ -178,49 +83,42 @@ def parse_layout_c(all_lines: list[str]) -> pd.DataFrame:
             if re.search(r"[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż]", nxt):
                 idx_lp.append(i)
 
-    # 2) Znajdź indeksy czystych 13-cyfrowych EAN-ów
+    # 2) Znajdź indeksy czystego EAN (13 cyfr)
     idx_ean = [i for i, ln in enumerate(all_lines) if re.fullmatch(r"\d{13}", ln)]
 
     products = []
     for idx, lp_idx in enumerate(idx_lp):
-        # 2a) EAN: spośród e_idx < lp_idx wybierz największy
+        # EAN – maksymalny e < lp_idx
         eans = [e for e in idx_ean if e < lp_idx]
-        barcode = None
-        if eans:
-            barcode = all_lines[max(eans)]
+        barcode = all_lines[max(eans)] if eans else None
 
-        # 2b) Name to linia immediately after lp_idx
-        Name_val = all_lines[lp_idx + 1]
+        # Name = linia zaraz po lp_idx
+        Name_val = all_lines[lp_idx + 1] if lp_idx + 1 < len(all_lines) else None
 
-        # 2c) Quantity: find "szt." below lp_idx, then qty = integer at +2
+        # Quantity – po znalezieniu "szt.", 2 linie dalej integer
         qty = None
         for j in range(lp_idx + 1, len(all_lines) - 2):
-            if all_lines[j].lower() == "szt.":
-                if re.fullmatch(r"\d+", all_lines[j + 2]):
-                    qty = int(all_lines[j + 2])
+            if all_lines[j].lower() == "szt." and re.fullmatch(r"\d+", all_lines[j + 2]):
+                qty = int(all_lines[j + 2])
                 break
 
-        # Jeżeli nie znaleziono qty, pomijamy tę pozycję
-        if qty is None:
-            continue
-
-        products.append({
-            "Lp": int(all_lines[lp_idx]),
-            "Name": Name_val.strip(),
-            "Quantity": qty,
-            "Barcode": barcode
-        })
+        if Name_val and qty is not None:
+            products.append({
+                "Lp": int(all_lines[lp_idx]),
+                "Name": Name_val.strip(),
+                "Quantity": qty,
+                "Barcode": barcode
+            })
 
     return pd.DataFrame(products)
 
 
 def parse_layout_a(all_lines: list[str]) -> pd.DataFrame:
     """
-    Parser dla układu A: "Kod kres.: <EAN>" w oddzielnej linii,
-    Lp to linia czysta-liczba, pod nią początek fragmentu nazwy,
-    nazwa może się dzielić przed/po kolumnie cen/ilości.
+    Parser dla układu A – „Kod kres.: <EAN>” w osobnej linii,
+    Lp to czysta liczba w osobnej linii, nazwa przed/po kolumnie cen.
     """
-    # 1) Znajdź indeksy Lp (linia czysta-liczba, pod nią linia z literami)
+    # 1) Indeksy Lp – czysta liczba, pod którą linia z literami
     idx_lp = []
     for i in range(len(all_lines) - 1):
         if re.fullmatch(r"\d+", all_lines[i]):
@@ -233,7 +131,7 @@ def parse_layout_a(all_lines: list[str]) -> pd.DataFrame:
             ):
                 idx_lp.append(i)
 
-    # 2) Znajdź indeksy linii "Kod kres"
+    # 2) Indeksy "Kod kres"
     idx_ean = [i for i, ln in enumerate(all_lines) if ln.startswith("Kod kres")]
 
     products = []
@@ -241,20 +139,19 @@ def parse_layout_a(all_lines: list[str]) -> pd.DataFrame:
         prev_lp = idx_lp[idx - 1] if idx > 0 else -1
         next_lp = idx_lp[idx + 1] if idx + 1 < len(idx_lp) else len(all_lines)
 
-        # 2a) EAN: spośród e in idx_ean takich, że prev_lp < e < next_lp, wybierz maksymalny
-        e_subset = [e for e in idx_ean if prev_lp < e < next_lp]
+        # a) Barcode – maksymalny e w idx_ean taki, że prev_lp < e < next_lp
         barcode = None
-        if e_subset:
-            parts = all_lines[max(e_subset)].split(":", 1)
+        valid_eans = [e for e in idx_ean if prev_lp < e < next_lp]
+        if valid_eans:
+            parts = all_lines[max(valid_eans)].split(":", 1)
             if len(parts) == 2:
                 barcode = parts[1].strip()
 
-        # 2b) Nazwa + Ilość:
+        # b) Zbierz fragmenty nazwy do ilości
         name_parts = []
         qty = None
         qty_idx = None
 
-        # Fragmenty nazwy przed kolumną ilości/ceny
         for j in range(lp_idx + 1, next_lp):
             ln = all_lines[j]
             if re.fullmatch(r"\d+", ln) and (j + 1 < next_lp and all_lines[j + 1].lower() == "szt."):
@@ -271,11 +168,10 @@ def parse_layout_a(all_lines: list[str]) -> pd.DataFrame:
             ):
                 name_parts.append(ln)
 
-        # Jeżeli brak qty_idx → pomiń
         if qty_idx is None:
             continue
 
-        # Po znalezieniu ilości, zbieraj kolejne fragmenty nazwy aż do "Kod kres"
+        # c) Po ilości: dopisz fragmenty nazwy aż do "Kod kres"
         for k in range(qty_idx + 1, next_lp):
             ln2 = all_lines[k]
             if ln2.startswith("Kod kres"):
@@ -303,7 +199,7 @@ def parse_layout_a(all_lines: list[str]) -> pd.DataFrame:
 
 # ──────────────────────────────────────────────────────────────────────────────
 
-# 1) FileUploader – użytkownik wgrywa PDF
+# 1) FileUploader – wgraj PDF
 uploaded_file = st.file_uploader("Wybierz plik PDF ze zamówieniem", type=["pdf"])
 if uploaded_file is None:
     st.info("Proszę wgrać plik PDF, aby kontynuować.")
@@ -312,24 +208,23 @@ if uploaded_file is None:
 # 2) Pobierz bajty PDF-a
 pdf_bytes = uploaded_file.read()
 
-# 3) Wyciągnij wszystkie linie tekstu (fitz → PyPDF2 → OCR)
-all_lines = extract_text_from_pdf_bytes(pdf_bytes)
+# 3) Wyciągnij linie tekstu przez PyPDF2
+all_lines = extract_text_with_pypdf2(pdf_bytes)
 
-# 4) Jeśli nadal brak linii – zakończ z komunikatem
+# 4) Jeśli brak linii – komunikat o konieczności OCR i koniec
 if not all_lines:
     st.error(
-        "Nie udało się wyciągnąć tekstu z PDF-a. "
-        "Prawdopodobnie jest to czysty skan/obraz i nie udał się OCR. "
-        "Upewnij się, że `pdftoppm` i `tesseract` są zainstalowane."
+        "Nie udało się wyciągnąć tekstu z tego PDF-a. "
+        "Prawdopodobnie jest to skan/obraz. "
+        "Aby sparsować, wykonaj OCR (np. narzędziem Tesseract) i spróbuj ponownie."
     )
     st.stop()
 
-# 5) Wykryj układ B (Lp + EAN w tej samej linii)
+# 5) Wykryj układ B (Lp + EAN w jednej linii)
 pattern_b = re.compile(r"^\d+\s+\d{13}\s+.+\s+\d{1,3},\d{2}\s+szt", flags=re.IGNORECASE)
 is_layout_b = any(pattern_b.match(ln) for ln in all_lines)
 
-# 6) Wykryj układ C: jeżeli jest czysty 13-cyfrowy EAN w osobnej linii,
-#    ale nie pasuje do układu B
+# 6) Wykryj układ C (czysty 13-cyfrowy EAN w liniach, ale nie Układ B)
 has_pure_ean = any(re.fullmatch(r"\d{13}", ln) for ln in all_lines)
 is_layout_c = has_pure_ean and not is_layout_b
 
@@ -341,11 +236,11 @@ elif is_layout_c:
 else:
     df = parse_layout_a(all_lines)
 
-# 8) Jeżeli w DataFrame są kolumny "Name" i "Quantity", usuń wiersze z brakami
+# 8) Jeżeli są kolumny "Name" i "Quantity", odfiltrowujemy wiersze z brakami
 if "Name" in df.columns and "Quantity" in df.columns:
     df = df.dropna(subset=["Name", "Quantity"]).reset_index(drop=True)
 
-# 9) Wyświetl wynik w Streamlit
+# 9) Wyświetl tabelę w Streamlit
 st.subheader("Wyekstrahowane pozycje zamówienia")
 st.dataframe(df, use_container_width=True)
 
@@ -361,5 +256,5 @@ st.download_button(
     label="Pobierz wynik jako Excel",
     data=excel_data,
     file_name="parsed_zamowienie.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )

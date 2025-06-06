@@ -1,56 +1,78 @@
-# pdf_to_excel.py
+# app.py
 
-import sys
-import re
-import io
-import argparse
-
+import streamlit as st
 import pandas as pd
+import re
 import PyPDF2
+import io
 
-# --- jeśli chcesz obsługiwać trudniejsze PDF-y (jak „Wydruk.pdf”), 
-# --- zainstaluj najpierw pdfplumber: pip install pdfplumber
+# Spróbuj zaimportować pdfplumber – jeśli jest zainstalowane, użyjemy go jako fallback do wydobycia tekstu
 try:
     import pdfplumber
     _HAS_PDFPLUMBER = True
 except ImportError:
     _HAS_PDFPLUMBER = False
 
+st.set_page_config(page_title="PDF → Excel", layout="wide")
+st.title("PDF → Excel")
 
-def extract_text_lines(pdf_path: str) -> list[str]:
+if not _HAS_PDFPLUMBER:
+    st.warning(
+        "Uwaga: w środowisku nie zainstalowano biblioteki `pdfplumber`. "
+        "Jeśli PyPDF2 nie będzie w stanie wydobyć tekstu z niektórych PDF-ów (np. „Wydruk.pdf”), "
+        "zainstaluj `pdfplumber` przez `pip install pdfplumber`."
+    )
+
+st.markdown(
     """
-    Wyciąga wszystkie niepuste linie tekstu z PDF-a w dwóch krokach:
-    1) PyPDF2
-    2) (jeśli PyPDF2 nie da nic sensownego i pdfplumber jest dostępny) pdfplumber
+    Wgraj plik PDF ze zamówieniem. Aplikacja:
+    1. Wyciąga tekst przez PyPDF2.  
+    2. Jeśli PyPDF2 nie zwróci sensownych linii (np. „gibberish”), a `pdfplumber` jest dostępny, 
+       próbuje ponownie z `pdfplumber`.  
+    3. Gdy mamy listę wierszy (`all_lines`), wykrywamy układ:
+       - **Układ B**: jedna pozycja w jednym wierszu, np.  
+         `1 5029040012366 Nazwa Produktu 96,00 szt.`  
+       - **Układ C**: czysty 13-cyfrowy EAN w osobnej linii, potem Lp, potem nazwę, potem „szt.” i ilość.  
+       - **Układ A**: wiersz „Kod kres.: <EAN>”, Lp w osobnej linii, fragmenty nazwy przed i po kolumnie ceny/ilości.  
+    4. W zależności od wykrytego układu wywołujemy odpowiedni parser (A, B lub C).  
+    5. Wyświetlamy tabelę z kolumnami `Lp`, `Name`, `Quantity`, `Barcode` i umożliwiamy pobranie pliku Excel.
     """
+)
+
+
+def extract_text(pdf_bytes: bytes) -> list[str]:
+    """
+    Najpierw próbuje wydobyć tekst przy pomocy PyPDF2.
+    Jeśli wynik nie zawiera przynajmniej jednej linii pasującej do wzorca (Lp/EAN) 
+    i jeśli pdfplumber jest zainstalowane, próbuje ponownie z pdfplumber.
+    Zwraca listę niepustych, obciętych linii.
+    """
+    # 1) PyPDF2
     lines = []
-
-    # 1) Próba z PyPDF2
     try:
-        with open(pdf_path, "rb") as f:
-            reader = PyPDF2.PdfReader(f)
-            for page in reader.pages:
-                text = page.extract_text() or ""
-                for ln in text.split("\n"):
-                    stripped = ln.strip()
-                    if stripped:
-                        lines.append(stripped)
+        reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
+        for page in reader.pages:
+            text = page.extract_text() or ""
+            for ln in text.split("\n"):
+                stripped = ln.strip()
+                if stripped:
+                    lines.append(stripped)
     except Exception:
         lines = []
 
-    # Sprawdź, czy mamy przynajmniej jedną sensowną linię (EAN lub nagłówek "Lp")
-    has_ean_or_header = any(
-        re.fullmatch(r"\d{13}", ln) or ln.lower().startswith("lp")
+    # Sprawdźmy, czy PyPDF2 zwróciło przynajmniej jedną linię zaczynającą się od liczby lub „Kod kres.”
+    has_layout_indicator = any(
+        re.match(r"^\d+", ln) or ln.lower().startswith("kod kres") 
         for ln in lines
     )
-    if has_ean_or_header and lines:
+    if has_layout_indicator and lines:
         return lines
 
-    # 2) Jeśli PyPDF2 nic nie dał, spróbuj pdfplumber
+    # 2) Fallback na pdfplumber (jeśli dostępne)
     if _HAS_PDFPLUMBER:
         pl_lines = []
         try:
-            with pdfplumber.open(pdf_path) as pdf:
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
                 for page in pdf.pages:
                     text = page.extract_text() or ""
                     for ln in text.split("\n"):
@@ -63,211 +85,235 @@ def extract_text_lines(pdf_path: str) -> list[str]:
         if pl_lines:
             return pl_lines
 
-    # Jeżeli dalej pusto, zwracamy to, co mamy (może to być lista pusta)
+    # Jeśli wszystko zawiedzie, zwracamy to, co mamy (może być puste)
     return lines
-
-
-def parse_layout_a(all_lines: list[str]) -> pd.DataFrame:
-    """
-    Układ A:
-      - W linii: 'Kod kres.: <13-cyfrowy EAN>'
-      - Następna linia: Lp (liczba)
-      - Kolejne linie: fragmenty nazwy aż do wiersza z 'szt.' i ilością
-    """
-    produkty = []
-    for idx, ln in enumerate(all_lines):
-        if "Kod kres.:" in ln:
-            m_ean = re.search(r"(\d{13})", ln)
-            if not m_ean:
-                continue
-            barcode = m_ean.group(1)
-
-            # następny wiersz to Lp
-            if idx + 1 < len(all_lines) and all_lines[idx + 1].isdigit():
-                lp = int(all_lines[idx + 1])
-            else:
-                continue
-
-            name_parts = []
-            qty = None
-            j = idx + 2
-            while j < len(all_lines):
-                if "szt" in all_lines[j].lower():
-                    # przykładowo "96,00 szt."
-                    m_qty = re.search(r"([\d\s,]+)\s*szt", all_lines[j], re.IGNORECASE)
-                    if m_qty:
-                        qty_str = m_qty.group(1).replace(" ", "")
-                        qty = float(qty_str.replace(",", "."))
-                    break
-                else:
-                    name_parts.append(all_lines[j])
-                j += 1
-
-            name = " ".join(name_parts).strip()
-            produkty.append({
-                "Lp": lp,
-                "Name": name,
-                "Quantity": qty if qty is not None else 0,
-                "Barcode": barcode
-            })
-
-    return pd.DataFrame(produkty)
 
 
 def parse_layout_b(all_lines: list[str]) -> pd.DataFrame:
     """
-    Układ B:
-      Każda pozycja w jednej linii, np.:
-        1 5029040012366 Nazwa Produktu 96,00 szt.
+    Parser dla układu B – każda pozycja w jednej linii:
+      <Lp> <EAN(13)> <pełna nazwa> <ilość>,<xx> szt …
     Regex: ^(\d+)\s+(\d{13})\s+(.+?)\s+([\d,]+)\s+szt
     """
-    produkty = []
-    wzorzec = re.compile(r"^(\d+)\s+(\d{13})\s+(.+?)\s+([\d,]+)\s+szt", re.IGNORECASE)
+    products = []
+    pattern = re.compile(
+        r"^(\d+)\s+(\d{13})\s+(.+?)\s+([\d,]+)\s+szt", 
+        flags=re.IGNORECASE
+    )
     for ln in all_lines:
-        m = wzorzec.match(ln)
-        if not m:
-            continue
-        lp = int(m.group(1))
-        barcode = m.group(2)
-        name = m.group(3).strip()
-        qty = float(m.group(4).replace(",", "."))
-        produkty.append({
-            "Lp": lp,
-            "Name": name,
-            "Quantity": qty,
-            "Barcode": barcode
-        })
-
-    return pd.DataFrame(produkty)
+        m = pattern.match(ln)
+        if m:
+            Lp_val = int(m.group(1))
+            Barcode_val = m.group(2)
+            Name_val = m.group(3).strip()
+            qty_str = m.group(4).replace(",", ".")
+            try:
+                Quantity_val = float(qty_str)
+            except ValueError:
+                Quantity_val = 0.0
+            products.append({
+                "Lp": Lp_val,
+                "Name": Name_val,
+                "Quantity": Quantity_val,
+                "Barcode": Barcode_val
+            })
+    return pd.DataFrame(products)
 
 
 def parse_layout_c(all_lines: list[str]) -> pd.DataFrame:
     """
-    Układ C:
-      - Linia zawiera sam 13-cyfrowy EAN
-      - Następna linia: Lp
-      - Kolejne wiersze: fragmenty nazwy aż do wiersza z 'szt.' i ilością
+    Parser dla układu C – czysty 13-cyfrowy EAN w osobnej linii, potem Lp, potem Name, 
+    potem "szt." i Quantity.
     """
-    produkty = []
-    idx = 0
-    while idx < len(all_lines):
-        ln = all_lines[idx]
-        if re.fullmatch(r"\d{13}", ln):
-            barcode = ln
-            if idx + 1 < len(all_lines) and all_lines[idx + 1].isdigit():
-                lp = int(all_lines[idx + 1])
-            else:
-                idx += 1
-                continue
+    idx_lp = []
+    for i in range(len(all_lines) - 1):
+        if re.fullmatch(r"\d+", all_lines[i]):
+            nxt = all_lines[i + 1]
+            if re.search(r"[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż]", nxt):
+                idx_lp.append(i)
 
-            name_parts = []
-            qty = None
-            j = idx + 2
-            while j < len(all_lines):
-                if "szt" in all_lines[j].lower():
-                    m_qty = re.search(r"([\d\s,]+)\s*szt", all_lines[j], re.IGNORECASE)
-                    if m_qty:
-                        qty_str = m_qty.group(1).replace(" ", "")
-                        qty = float(qty_str.replace(",", "."))
-                    break
-                else:
-                    name_parts.append(all_lines[j])
-                j += 1
+    idx_ean = [i for i, ln in enumerate(all_lines) if re.fullmatch(r"\d{13}", ln)]
+    products = []
+    for lp_idx in idx_lp:
+        # Przypisz EAN – ostatni indeks < lp_idx
+        eans = [e for e in idx_ean if e < lp_idx]
+        barcode = all_lines[max(eans)] if eans else None
 
-            name = " ".join(name_parts).strip()
-            produkty.append({
-                "Lp": lp,
-                "Name": name,
-                "Quantity": qty if qty is not None else 0,
+        Name_val = all_lines[lp_idx + 1] if lp_idx + 1 < len(all_lines) else None
+
+        qty = None
+        for j in range(lp_idx + 1, len(all_lines) - 2):
+            if all_lines[j].lower() == "szt." and re.fullmatch(r"[\d,]+", all_lines[j + 1]):
+                qty_str = all_lines[j + 1].replace(",", ".")
+                try:
+                    qty = float(qty_str)
+                except ValueError:
+                    qty = None
+                break
+
+        if Name_val and qty is not None:
+            products.append({
+                "Lp": int(all_lines[lp_idx]),
+                "Name": Name_val.strip(),
+                "Quantity": qty,
+                "Barcode": barcode
+            })
+    return pd.DataFrame(products)
+
+
+def parse_layout_a(all_lines: list[str]) -> pd.DataFrame:
+    """
+    Parser dla układu A – „Kod kres.: <EAN>” w osobnej linii,
+    Lp to czysta liczba w osobnej linii, fragmenty nazwy przed i po kolumnie cen/ilości.
+    """
+    idx_lp = []
+    for i in range(len(all_lines) - 1):
+        if re.fullmatch(r"\d+", all_lines[i]):
+            nxt = all_lines[i + 1]
+            if (
+                re.search(r"[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż]", nxt)
+                and nxt.lower() != "szt."
+                and not re.fullmatch(r"[\d,]+\s*szt", nxt, re.IGNORECASE)
+                and not nxt.lower().startswith("kod kres")
+            ):
+                idx_lp.append(i)
+
+    idx_ean = [i for i, ln in enumerate(all_lines) if ln.lower().startswith("kod kres")]
+
+    products = []
+    for idx, lp_idx in enumerate(idx_lp):
+        prev_lp = idx_lp[idx - 1] if idx > 0 else -1
+        next_lp = idx_lp[idx + 1] if idx + 1 < len(idx_lp) else len(all_lines)
+
+        # Spośród linii „Kod kres…” w przedziale (prev_lp, next_lp) wybierz ostatnią
+        valid_eans = [e for e in idx_ean if prev_lp < e < next_lp]
+        barcode = None
+        if valid_eans:
+            parts = all_lines[max(valid_eans)].split(":", 1)
+            if len(parts) == 2:
+                barcode = parts[1].strip()
+
+        # Zbierz fragmenty nazwy aż do wiersza z ilością
+        name_parts = []
+        qty = None
+        qty_idx = None
+
+        for j in range(lp_idx + 1, next_lp):
+            ln = all_lines[j]
+            if re.fullmatch(r"[\d,]+\s*szt", ln, re.IGNORECASE):
+                # np. "96,00 szt"
+                m_qty = re.search(r"([\d,]+)\s*szt", ln, re.IGNORECASE)
+                if m_qty:
+                    qty_str = m_qty.group(1).replace(",", ".")
+                    try:
+                        qty = float(qty_str)
+                    except ValueError:
+                        qty = None
+                qty_idx = j
+                break
+            if (
+                re.search(r"[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż]", ln)
+                and not ln.lower().startswith("vat")
+                and ln != "/"
+                and not ln.lower().startswith("kod kres")
+            ):
+                name_parts.append(ln)
+
+        if qty_idx is None:
+            continue
+
+        # Dodatkowe fragmenty nazwy po qty_idx, aż do next_lp
+        for k in range(qty_idx + 1, next_lp):
+            ln2 = all_lines[k]
+            if ln2.lower().startswith("kod kres"):
+                break
+            if (
+                re.search(r"[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż]", ln2)
+                and not ln2.lower().startswith("vat")
+                and ln2 != "/"
+            ):
+                name_parts.append(ln2)
+
+        Name_val = " ".join(name_parts).strip()
+        if Name_val and qty is not None:
+            products.append({
+                "Lp": int(all_lines[lp_idx]),
+                "Name": Name_val,
+                "Quantity": qty,
                 "Barcode": barcode
             })
 
-            idx = j + 1
-        else:
-            idx += 1
-
-    return pd.DataFrame(produkty)
+    return pd.DataFrame(products)
 
 
-def detect_layout(all_lines: list[str]) -> str:
-    """
-    Wykrywa układ A, B lub C na podstawie:
-      - B: jeżeli którakolwiek linia pasuje do wzorca B (^\d+\s+\d{13}\s+…\s+[\d,]+\s+szt)
-      - C: jeżeli przynajmniej jedna linia to dokładnie 13 cyfr
-      - Inaczej: A
-    """
-    pattern_b = re.compile(r"^\d+\s+\d{13}\s+.+\s+[\d,]+\s+szt", re.IGNORECASE)
-    if any(pattern_b.match(ln) for ln in all_lines):
-        return "B"
-    if any(re.fullmatch(r"\d{13}", ln) for ln in all_lines):
-        return "C"
-    return "A"
+# ──────────────────────────────────────────────────────────────────────────────
 
+# 1) Wgraj PDF
+uploaded_file = st.file_uploader("Wybierz plik PDF ze zamówieniem", type=["pdf"])
+if uploaded_file is None:
+    st.info("Proszę wgrać plik PDF, aby kontynuować.")
+    st.stop()
 
-def convert_dataframe_to_excel(df: pd.DataFrame, output_path: str) -> None:
-    """
-    Zapisuje cały DataFrame do jednego arkusza Excela (sheet_name="Zamowienie").
-    """
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Zamowienie")
+pdf_bytes = uploaded_file.read()
 
+# 2) Wyciągnij linie tekstu (PyPDF2 + opcjonalnie pdfplumber)
+all_lines = extract_text(pdf_bytes)
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Konwerter PDF → Excel (jeden arkusz)."
+# 3) Jeśli brak linii – komunikat o konieczności OCR
+if not all_lines:
+    st.error(
+        "Nie udało się wyciągnąć tekstu z tego PDF-a. "
+        "Prawdopodobnie wymaga OCR lub ma niestandardową warstwę czcionek. "
+        "Jeśli masz `pdfplumber`, upewnij się, że jest zainstalowane."
     )
-    parser.add_argument(
-        "pdf_file",
-        help="Ścieżka do wejściowego pliku PDF."
+    st.stop()
+
+# 4) Wykryj układ B (jedna pozycja w jednej linii)
+pattern_b = re.compile(r"^\d+\s+\d{13}\s+.+\s+[\d,]+\s+szt", flags=re.IGNORECASE)
+is_layout_b = any(pattern_b.match(ln) for ln in all_lines)
+
+# 5) Wykryj układ C (czysty 13-cyfrowy EAN, ale nie układ B)
+has_pure_ean = any(re.fullmatch(r"\d{13}", ln) for ln in all_lines)
+is_layout_c = has_pure_ean and not is_layout_b
+
+# 6) Parsuj w zależności od układu
+if is_layout_b:
+    df = parse_layout_b(all_lines)
+elif is_layout_c:
+    df = parse_layout_c(all_lines)
+else:
+    df = parse_layout_a(all_lines)
+
+# 7) Odfiltruj wiersze bez nazwy lub ilości (jeśli te kolumny istnieją)
+if "Name" in df.columns and "Quantity" in df.columns:
+    df = df.dropna(subset=["Name", "Quantity"]).reset_index(drop=True)
+
+# 8) Jeśli DataFrame pusty → komunikat
+if df.empty:
+    st.warning(
+        "Nie znaleziono żadnych pozycji w pliku PDF. "
+        "Sprawdź, czy dokument jest zgodny z jednym z obsługiwanych układów:\n"
+        "- Układ B: `Lp EAN Nazwa ilość,xx szt`\n"
+        "- Układ C: linia z 13 cyframi (EAN), potem Lp, Nazwa, `szt.` i ilość\n"
+        "- Układ A: linia `Kod kres.: EAN`, potem Lp, fragmenty nazwy, `ilość szt.`"
     )
-    parser.add_argument(
-        "excel_file",
-        help="Ścieżka, gdzie zapisać wynikowy plik Excel (.xlsx)."
-    )
-    args = parser.parse_args()
+    st.stop()
 
-    pdf_path = args.pdf_file
-    excel_path = args.excel_file
+# 9) Wyświetlenie tabeli w Streamlit
+st.subheader("Wyekstrahowane pozycje zamówienia")
+st.dataframe(df, use_container_width=True)
 
-    # 1) Wydobycie wyczyszczonych linii tekstu
-    all_lines = extract_text_lines(pdf_path)
-    if not all_lines:
-        print(
-            "Błąd: nie udało się wyciągnąć żadnych linii tekstu z PDF-a.\n"
-            "Jeżeli plik jest zeskanowanym obrazem lub PyPDF2 nic nie znalazł, "
-            "upewnij się, że zainstalowałeś pdfplumber (`pip install pdfplumber`), "
-            "aby obsłużyć zaszyfrowane fonty/skany."
-        )
-        sys.exit(1)
+# 10) Przygotowanie do pobrania jako Excel
+def convert_df_to_excel(df_in: pd.DataFrame) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df_in.to_excel(writer, index=False, sheet_name="Zamówienie")
+    return output.getvalue()
 
-    # 2) Wykrycie układu
-    layout = detect_layout(all_lines)
-    if layout == "A":
-        df = parse_layout_a(all_lines)
-    elif layout == "B":
-        df = parse_layout_b(all_lines)
-    else:  # "C"
-        df = parse_layout_c(all_lines)
-
-    # 3) Sprawdź, czy coś się znalazło
-    if df.empty:
-        print(
-            f"Wykryto układ {layout}, ale nie znaleziono żadnych pozycji w pliku.\n"
-            "Upewnij się, że plik PDF jest zgodny z którymś z obsługiwanych formatów:\n"
-            "- Układ A: linia z 'Kod kres.: <EAN>' + Lp + nazwa + 'szt.'\n"
-            "- Układ B: pełna pozycja w formacie '1 5029040012366 Nazwa 96,00 szt.'\n"
-            "- Układ C: osobny wiersz z 13-cyfrowym EAN, potem Lp, potem nazwa, potem 'szt.'\n"
-        )
-        sys.exit(1)
-
-    # 4) Zapis do Excela w jednym arkuszu
-    try:
-        convert_dataframe_to_excel(df, excel_path)
-        print(f"Gotowe! Zapisano {len(df)} pozycji do pliku Excel: {excel_path}")
-    except Exception as e:
-        print(f"Błąd przy zapisie do Excela: {e}")
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
+excel_data = convert_df_to_excel(df)
+st.download_button(
+    label="Pobierz wynik jako Excel",
+    data=excel_data,
+    file_name="parsed_zamowienie.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)

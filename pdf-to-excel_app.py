@@ -1,3 +1,5 @@
+# app.py
+
 import streamlit as st
 import pandas as pd
 import re
@@ -5,52 +7,162 @@ import PyPDF2
 import io
 
 st.set_page_config(page_title="PDF → Excel", layout="wide")
-st.title("Konwerter zamówienia PDF → Excel")
+st.title("Konwerter zamówienia PDF → Excel (obsługa dodatkowych układów)")
 
-#st.markdown(
- #   """
-  #  Wgraj plik PDF ze zamówieniem. Aplikacja:
-   # 1. Połączy wszystkie strony w jeden ciąg wierszy, pomijając:
-    #   - Stopki (linie zaczynające się od "Strona", "Wydrukowano" lub zawierające "ZD <numer>"),
-     #  - Powtarzające się nagłówki tabeli: każdą linię zaczynającą się od "Lp" (niebędącą czystą liczbą),
-      #   każdą linię zaczynającą się od "Nazwa towaru", oraz wiersze: "Ilość", "J. miary", "Cena", "Wartość",
-       #  "netto", "brutto", "Indeks katalogowy".
-  #  2. Na scalonym ciągu (`all_lines`):
-   #    - Zidentyfikuje wszystkie pozycje Lp – każdą linię, która jest czystą liczbą, a w kolejnej linii pojawiają się litery 
-    #     (i ta kolejna linia nie jest "szt." ani wierszem ceny ani "Kod kres").  
-     #  - Zlokalizuje wszystkie linie „Kod kres.: <EAN>” i utworzy listę indeksów `idx_ean`.
-      # - Podzieli `all_lines` na „interwały” oddzielone pozycjami Lp. Dla każdej pozycji Lp weźmie dokładnie te linie, 
-       #  które między nią a następną pozycją Lp się znajdują. W tej grupie:
-        # • znajdzie tzw. `qty_idx` (pierwszą linię będącą czystą liczbą, której kolejna linia to "szt.") → to jest `Ilość`,  
-   #      • zbierze fragmenty nazwy – wszystkie wiersze zawierające litery (nie wyglądające jak cena, nie zaczynające się od “VAT”, nie będące “/”, 
-    #       nie zaczynające się od “ARA” ani “KAT”), zarówno _przed_ jak i _po_ kolumnie ilości/ceny, aż do momentu napotkania linii “Kod kres”.  
-     #    • spośród `idx_ean` wybierze ten indeks `e` (jeśli istnieje), który leży w przedziale `(poprzednie_Lp, następne_Lp)` i jest największy (czyli EAN dla tej pozycji).  
-      # • Sklei pełną nazwę, ustawi `Ilość`, pobierze `Symbol`.  
-   
-# 3. Wyświetli wynik jako tabelę z kolumnami:
- #      `Lp`, `Name`, `Ilość`, `Symbol`  
-  #     oraz umożliwi pobranie pliku Excel, zawierającego te cztery kolumny.
-   # """
-#)
+st.markdown(
+    """
+    Wgraj plik PDF ze zamówieniem. Aplikacja:
+    1. Próbuje automatycznie wykryć, w jakim układzie jest PDF:
+       - **Układ A** („Kod kres” w osobnej kolumnie, część wierszy rozbita między strony),
+       - **Układ B** (EAN jest w tej samej linii co Lp, np. „1 5029040012366 Canagan Cat … 96,00 szt.”).
+    2. Dla **Układu A** działa stary uniwersalny parser („Kod kres” na osobnej linii, nazwa rozbita przed/po cenach).
+    3. Dla **Układu B** stosuje wzorzec pojedynczej linii:
+       ```
+       <Lp> <EAN> <pełna nazwa produktu> <ilość_liczba>,<liczba> szt. <…inne kolumny…>
+       ```
+       – w takim wierszu natychmiast wyciągamy:
+         • Lp = pierwsza liczba,  
+         • Barcode = druga liczba (zwykle 13-cyfrowa, EAN),  
+         • Name = tekst między EAN a ilością (ciąg liter/nawiasów/spacji) aż do wiersza „<ilość>,<…> szt.”,  
+         • Quantity = liczba przed „,00” i „szt.”.  
+    4. W efekcie obsłużymy teraz 3 formaty:
+       - PDF z “Kod kres” w osobnych wierszach (pierwsze dwa przykłady),
+       - PDF z EAN w tej samej linii co Lp (np. “Wydruk.pdf”).
+    5. Wynik: tabela z kolumnami `Lp`, `Name`, `Quantity`, `Barcode` i możliwość pobrania pliku Excel.
+    """
+)
+
+def parse_layout_a(all_lines: list[str]) -> pd.DataFrame:
+    """
+    Parser dla układu, gdzie Lp i nazwa mogą być w odrębnych wierszach,
+    a "Kod kres.: <EAN>" występuje w osobnej linii.
+    Kod EAN przypisujemy do ostatniego wcześniejszego Lp.
+    Nazwę scalamy z fragmentów przed i po kolumnie cen.
+    """
+    # 1) Znajdź wszystkie indeksy Lp: linia czysta-liczba, a w poniższej linijce są litery (nie "szt." i nie cena i nie "Kod kres")
+    idx_lp = []
+    for i in range(len(all_lines) - 1):
+        if re.fullmatch(r"\d+", all_lines[i]):
+            nxt = all_lines[i + 1]
+            if (
+                re.search(r"[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż]", nxt)
+                and nxt.lower() != "szt."
+                and not re.fullmatch(r"\d{1,3}(?: \d{3})*,\d{2}", nxt)
+                and not nxt.startswith("Kod kres")
+            ):
+                idx_lp.append(i)
+
+    # 2) Znajdź wszystkie indeksy EAN (linię zaczynającą się od "Kod kres")
+    idx_ean = [i for i, ln in enumerate(all_lines) if ln.startswith("Kod kres")]
+
+    products = []
+    for idx, lp_idx in enumerate(idx_lp):
+        prev_lp = idx_lp[idx - 1] if idx > 0 else -1
+        next_lp = idx_lp[idx + 1] if idx + 1 < len(idx_lp) else len(all_lines)
+
+        # 2a) EAN: spośród wszystkich e in idx_ean, takich że prev_lp < e < next_lp, weź maksymalny e
+        barcode = None
+        valid_eans = [e for e in idx_ean if prev_lp < e < next_lp]
+        if valid_eans:
+            eidx = max(valid_eans)
+            parts = all_lines[eidx].split(":", 1)
+            if len(parts) == 2:
+                barcode = parts[1].strip()
+
+        # 2b) Nazwa + Quantity: od razu po lp_idx + 1 zbieramy fragmenty aż do wiersza <liczba> +"szt."
+        name_parts = []
+        qty = None
+        qty_idx = None
+
+        for j in range(lp_idx + 1, next_lp):
+            ln = all_lines[j]
+            # jeśli czysta liczba, a poniższy wiersz == "szt." → to ilość
+            if re.fullmatch(r"\d+", ln) and (j + 1 < next_lp and all_lines[j + 1].lower() == "szt."):
+                qty_idx = j
+                qty = int(ln)
+                break
+            # w przeciwnym razie, jeśli ln zawiera litery (i nie jest cena, nie "VAT", nie "/") → fragment nazwy
+            if (
+                re.search(r"[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż]", ln)
+                and not re.fullmatch(r"\d{1,3}(?: \d{3})*,\d{2}", ln)
+                and not ln.startswith("VAT")
+                and ln != "/"
+                and not ln.startswith("ARA")
+                and not ln.startswith("KAT")
+            ):
+                name_parts.append(ln)
+
+        # jeśli nie znaleziono qty → pomiń
+        if qty_idx is None:
+            continue
+
+        # 2c) Po znalezieniu qty, idź dalej aż do next_lp lub "Kod kres", dopisując fragmenty nazwy
+        for k in range(qty_idx + 1, next_lp):
+            ln2 = all_lines[k]
+            if ln2.startswith("Kod kres"):
+                break
+            if (
+                re.search(r"[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż]", ln2)
+                and not re.fullmatch(r"\d{1,3}(?: \d{3})*,\d{2}", ln2)
+                and not ln2.startswith("VAT")
+                and ln2 != "/"
+                and not ln2.startswith("ARA")
+                and not ln2.startswith("KAT")
+            ):
+                name_parts.append(ln2)
+
+        Name_val = " ".join(name_parts).strip()
+        products.append({
+            "Lp": int(all_lines[lp_idx]),
+            "Name": Name_val,
+            "Quantity": qty,
+            "Barcode": barcode
+        })
+
+    df = pd.DataFrame(products)
+    return df
+
+
+def parse_layout_b(all_lines: list[str]) -> pd.DataFrame:
+    """
+    Parser dla układu, w którym cała pozycja (Lp, EAN, nazwa, ilość) jest w jednej linii, np:
+        1 5029040012366 Canagan Cat Can Chicken with Beef 75g 96,00 szt. 0,00 0,00
+    W takim wierszu:
+      - ^(\d+)\s+(\d{13})\s+(.+?)\s+(\d{1,3}),\d{2}\s+szt
+        wyciągamy Lp, EAN, Name i Quantity.
+      - Pozostałe dane (VAT, ceny netto/brutto) pomijamy.
+    """
+    products = []
+    pattern = re.compile(
+        r"^(\d+)\s+(\d{13})\s+(.+?)\s+(\d{1,3}),\d{2}\s+szt", 
+        flags=re.IGNORECASE
+    )
+    for ln in all_lines:
+        m = pattern.match(ln)
+        if m:
+            Lp_val = int(m.group(1))
+            Barcode_val = m.group(2)
+            Name_val = m.group(3).strip()
+            Quantity_val = int(m.group(4).replace(" ", ""))
+            products.append({
+                "Lp": Lp_val,
+                "Name": Name_val,
+                "Quantity": Quantity_val,
+                "Barcode": Barcode_val
+            })
+
+    df = pd.DataFrame(products)
+    return df
 
 
 def parse_pdf_generic(reader: PyPDF2.PdfReader) -> pd.DataFrame:
     """
-    Uniwersalny parser, który poradzi sobie z PDF-ami zawierającymi:
-      - format z nagłówkiem "Lp." 
-      - lub format z nagłówkiem "Nazwa towaru lub usługa" (choć ostatecznie oba wczytujemy tą samą logiką).
-    Kluczowe etapy:
-      1) Scalanie stron w `all_lines`, pomijając stopki i powtarzające się nagłówki.
-      2) Wyszukiwanie indeksów Lp (czysta liczba + poniżej linia z literami).
-      3) Wyszukiwanie indeksów EAN (linia zaczynająca się od "Kod kres").
-      4) Dla każdego Lp pobieranie:
-         - `Name`: wszystkie wiersze z literami (przed i po cenach) aż do napotkania linii "Kod kres",
-         - `Ilość`: ta liczba, której kolejna linia to "szt.",
-         - `Symbol`: EAN wybrany spośród wszystkich „Kod kres” leżących między tą pozycją Lp a następnym Lp.
-      5) Zwraca pandas.DataFrame z kolumnami ['Lp', 'Name', 'Ilość', 'Symbol'].
+    Miesza oba podejścia:
+      1) Najpierw zbiera wszystkie wiersze (pomijając stopki i nagłówki) do listy all_lines.
+      2) Następnie sprawdza, czy którykolwiek ln w all_lines pasuje do wzorca „Układ B” (Lp + EAN + nazwa w tej samej linii).
+         - Jeśli tak przynajmniej raz, przyjmuje, że to Układ B i wywołuje parse_layout_b().
+         - W przeciwnym razie wywołuje parse_layout_a().
     """
-
-    # 1) Scal wszystkie strony w all_lines, pomijając stopy i nagłówki
     all_lines = []
     started = False
 
@@ -59,7 +171,7 @@ def parse_pdf_generic(reader: PyPDF2.PdfReader) -> pd.DataFrame:
         for ln in raw:
             stripped = ln.strip()
 
-            # 1a) Jeśli to stopka → przerywamy tę stronę
+            # 1a) Stopki → jeśli znajdziemy "Wydrukowano", "Strona", lub "ZD <numer>", przerwij stronę
             if (
                 stripped.startswith("Wydrukowano")
                 or stripped.startswith("Strona")
@@ -67,12 +179,9 @@ def parse_pdf_generic(reader: PyPDF2.PdfReader) -> pd.DataFrame:
             ):
                 break
 
-            # 1b) Dopóki nie napotkamy nagłówka "Lp" lub "Nazwa towaru", pomijamy
+            # 1b) Dopóki nie napotkamy nagłówka "Lp" lub "Nazwa towaru", pomijamy wiersze wstępu
             if not started:
-                if (
-                    (stripped.startswith("Lp") and not stripped.isdigit())
-                    or stripped.lower().startswith("nazwa towaru")
-                ):
+                if (stripped.startswith("Lp") and not stripped.isdigit()) or stripped.lower().startswith("nazwa towaru"):
                     started = True
                     continue
                 else:
@@ -93,109 +202,17 @@ def parse_pdf_generic(reader: PyPDF2.PdfReader) -> pd.DataFrame:
             ):
                 continue
 
-            # 1d) W przeciwnym razie to faktyczne dane → dodajemy do all_lines
+            # 1d) W przeciwnym razie dodajemy stripped do all_lines
             all_lines.append(stripped)
 
-    n = len(all_lines)
+    # 2) Sprawdź, czy mamy przynajmniej jeden wiersz pasujący do Układu B (Lp + EAN w jednym ln)
+    pattern_b = re.compile(r"^\d+\s+\d{13}\s+.+\s+\d{1,3},\d{2}\s+szt", flags=re.IGNORECASE)
+    is_layout_b = any(pattern_b.match(ln) for ln in all_lines)
 
-    # 2) Znajdź indeksy Lp: linia = czysta liczba, a poniżej wiersz zawiera litery (i nie jest "szt." ani cena, ani "Kod kres")
-    idx_lp = []
-    for i in range(n - 1):
-        line = all_lines[i]
-        nxt = all_lines[i + 1]
-        if re.fullmatch(r"\d+", line):
-            # poniżej musi być tekst (fragment nazwy), a nie "szt." i nie wiersz-cena, nie "Kod kres"
-            if (
-                re.search(r"[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż]", nxt)
-                and nxt.lower() != "szt."
-                and not re.fullmatch(r"\d{1,3}(?: \d{3})*,\d{2}", nxt)
-                and not nxt.startswith("Kod kres")
-            ):
-                idx_lp.append(i)
-
-    # 3) Znajdź indeksy wszystkich "Kod kres"
-    idx_ean = [i for i, ln in enumerate(all_lines) if ln.startswith("Kod kres")]
-
-    # 4) Dla każdej pozycji Lp zbierz Name, Ilość i Symbol
-    products = []
-    for idx, lp_idx in enumerate(idx_lp):
-        prev_lp = idx_lp[idx - 1] if idx > 0 else -1
-        next_lp = idx_lp[idx + 1] if idx + 1 < len(idx_lp) else n
-
-        # 4a) Wybierz EAN w przedziale między poprzednim lp a kolejnym lp
-        symbol = None
-        valid_eans = [e for e in idx_ean if prev_lp < e < next_lp]
-        if valid_eans:
-            # bierzemy ten z największym indeksem (czyli najbliższy Lp od dołu)
-            e = max(valid_eans)
-            parts = all_lines[e].split(":", 1)
-            if len(parts) == 2:
-                symbol = parts[1].strip()
-
-        # 4b) Zbierz fragmenty nazwy i ilość
-        name_parts = []
-        ilosc = None
-        qty_idx = None
-
-        # ● Najpierw kolejne linie aż do wiersza "ilość":
-        for j in range(lp_idx + 1, next_lp):
-            ln = all_lines[j]
-            # jeśli trafimy na "ilość" (liczba, a poniższa linia to dokładnie "szt.") → to Ilość
-            if re.fullmatch(r"\d+", ln) and (j + 1 < next_lp and all_lines[j + 1].lower() == "szt."):
-                qty_idx = j
-                ilosc = int(ln)
-                break
-
-            # w przeciwnym razie, jeżeli to linia z literami, ale nie wygląda jak cena, nie zaczyna się od "VAT", nie jest "/" i nie jest kodem katalogowym "ARA..." lub "KAT..."
-            if (
-                re.search(r"[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż]", ln)
-                and ln.lower() != "szt."
-                and not re.fullmatch(r"\d{1,3}(?: \d{3})*,\d{2}", ln)
-                and not ln.startswith("VAT")
-                and ln != "/"
-                and not ln.startswith("ARA")
-                and not ln.startswith("KAT")
-            ):
-                name_parts.append(ln)
-
-        # Jeśli nie znaleziono ilości → pomiń
-        if qty_idx is None:
-            continue
-
-        # 4c) Po odczytaniu ilości, dalej zbieramy kolejny fragment nazwy aż do momentu, gdy napotkamy "Kod kres"
-        for k in range(qty_idx + 1, next_lp):
-            ln2 = all_lines[k]
-            if ln2.startswith("Kod kres"):
-                # natrafiliśmy na linię z EAN; przerwijmy zbieranie nazwy
-                break
-
-            # jeżeli to nazwa (litery) i nie wygląda jak cena, nie zaczyna się od "VAT", nie jest "/" i nie jest "ARA..." ani "KAT..."
-            if (
-                re.search(r"[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż]", ln2)
-                and ln2.lower() != "szt."
-                and not re.fullmatch(r"\d{1,3}(?: \d{3})*,\d{2}", ln2)
-                and not ln2.startswith("VAT")
-                and ln2 != "/"
-                and not ln2.startswith("ARA")
-                and not ln2.startswith("KAT")
-            ):
-                name_parts.append(ln2)
-
-        # 4d) Scalona nazwa i zapis do listy produktów
-        Name_val = " ".join(name_parts).strip()
-        products.append(
-            {
-                "Lp": int(all_lines[lp_idx]),
-                "Name": Name_val,
-                "Ilość": ilosc,
-                "Symbol": symbol,
-            }
-        )
-
-    # 5) Zbuduj DataFrame i usuń wiersze brakujące nazwy lub ilości
-    df = pd.DataFrame(products)
-    df = df.dropna(subset=["Name", "Ilość"]).reset_index(drop=True)
-    return df
+    if is_layout_b:
+        return parse_layout_b(all_lines)
+    else:
+        return parse_layout_a(all_lines)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -213,7 +230,7 @@ except Exception as e:
     st.error(f"Nie udało się wczytać PDF-a: {e}")
     st.stop()
 
-# 3) Parsowanie do DataFrame (pokazywany jest spinner podczas przetwarzania)
+# 3) Parsowanie do DataFrame (pokazujemy spinner dla większych plików)
 with st.spinner("Łączę strony i analizuję PDF…"):
     df = parse_pdf_generic(pdf_reader)
 

@@ -2,8 +2,6 @@ import streamlit as st
 import pandas as pd
 import re
 import io
-
-# Używamy pdfplumber zamiast PyPDF2/OCR, aby wydobyć tekst bez dodatkowych zależności
 import pdfplumber
 
 st.set_page_config(page_title="PDF → Excel", layout="wide")
@@ -12,17 +10,17 @@ st.title("PDF → Excel")
 st.markdown(
     """
     Wgraj plik PDF ze zamówieniem. Aplikacja:
-    1. Próbuje wyciągnąć tekst przy pomocy pdfplumber.
+    1. Wyciąga tekst przy pomocy `pdfplumber`.
     2. Jeśli nie wykryje w tekście ani jednego 13-cyfrowego EAN-u, wyświetli komunikat o konieczności OCR.
     3. Gdy już mamy listę wierszy (`all_lines`), wykrywamy układ:
-       - **Układ D**: proste linie zawierające tylko EAN i ilość, np.
-         `5029040012366 Nazwa Produktu 96,00 szt.` lub `5029040012366 96,00 szt.`
-       - **Układ B**: jedna pozycja w jednym wierszu, np.
-         `1 5029040012366 Nazwa Produktu 96,00 szt.`  
-       - **Układ C**: czysty wiersz z 13-cyfrowym EAN, potem numer Lp, potem nazwa, „szt.”, ilość.  
-       - **Układ A**: „Kod kres.: <EAN>” w osobnej linii, Lp w osobnej linii (czysta liczba), 
-         fragmenty nazwy przed i po kolumnie cen/ilości.
-    4. W zależności od wykrytego układu wywołujemy odpowiedni parser (D, A, B lub C).
+       - **Układ E**: pozycje zaczynające się od numeru Lp, potem nazwa, ilość, a poniżej „Kod kres.: <EAN>” (z opcjonalnymi wierszami kontynuacji nazwy i pomiędzy „ARA…”).  
+       - **Układ D**: proste linie zawierające tylko EAN i ilość, np.  
+         `5029040012366 Nazwa Produktu 96,00 szt.` albo `5029040012366 96,00 szt.`  
+       - **Układ B**: każda pozycja w jednej linii:  
+         `<Lp> <EAN(13)> <pełna nazwa> <ilość>,<xx> szt …`  
+       - **Układ C**: czysty 13-cyfrowy EAN w osobnej linii, potem Lp w osobnej linii, potem nazwa, „szt.” i ilość w kolejnych wierszach.  
+       - **Układ A**: „Kod kres.: <EAN>” w osobnej linii, Lp w osobnej linii, fragmenty nazwy przed/po kolumnie cen/ilości.  
+    4. W zależności od wykrytego układu wywołujemy odpowiedni parser (E, D, B, C lub A).
     5. Wyświetlamy tabelę z kolumnami `Lp`, `Name`, `Quantity`, `Barcode` i umożliwiamy pobranie pliku Excel.
     """
 )
@@ -45,6 +43,83 @@ def extract_text_with_pdfplumber(pdf_bytes: bytes) -> list[str]:
     except Exception:
         return []
     return lines
+
+
+def parse_layout_e(all_lines: list[str]) -> pd.DataFrame:
+    """
+    Parser dla układu E – linie zaczynające się od Lp i nazwy, potem ilość w tym samym wierszu,
+    a poniżej mogą się pojawić wiersze z katalogiem (ARA...) lub kontynuacje nazwy,
+    a następnie linia „Kod kres.: <EAN>”.
+    
+    Przykład sekwencji w all_lines:
+      1 CANAGAN Kot 375g Country Game 6 szt. 20,60 123,60 133,49
+      ARA000585
+      Kod kres.: 5029040012892
+      2 CANAGAN Kot 375g Dental Free 5 szt. 18,68 93,40 100,87
+      Run Turkey
+      ARA000613
+      Kod kres.: 5029040013318
+      ...
+    
+    Logika:
+      - Szukamy linii rozpoczynającej się od Lp (cyfra) i zawierającej „<ilość> szt.”.
+      - Grupa 1: numer Lp; grupa 2: początkowa część nazwy; grupa 3: ilość.
+      - Następnie zbieramy kolejne wiersze aż do momentu napotkania „Kod kres.:” – 
+        wszystkie wiersze niebędące alfanumerycznym „ARA…” są traktowane jako kontynuacja nazwy.
+      - Gdy napotkamy „Kod kres.: <EAN>”, wyciągamy EAN i kończymy zbieranie dla tego Lp.
+    """
+    products = []
+    i = 0
+    # Wzorzec: Lp na początku, potem nazwa, potem liczba (ilość) przed "szt."
+    pattern_item = re.compile(r"^(\d+)\s+(.+?)\s+(\d{1,3})\s+szt\.", flags=re.IGNORECASE)
+    while i < len(all_lines):
+        ln = all_lines[i]
+        m = pattern_item.match(ln)
+        if m:
+            Lp_val = int(m.group(1))
+            initial_name = m.group(2).strip()
+            Quantity_val = int(m.group(3))
+            name_parts = [initial_name]
+            barcode = None
+
+            # Przechodzimy do kolejnych wierszy, szukając linii z "Kod kres.:"
+            j = i + 1
+            while j < len(all_lines):
+                next_ln = all_lines[j]
+
+                # Jeśli linia zaczyna się od "Kod kres.:", wyciągamy EAN i kończymy
+                if next_ln.lower().startswith("kod kres"):
+                    parts = next_ln.split(":", 1)
+                    if len(parts) == 2:
+                        barcode = parts[1].strip()
+                    j += 1
+                    break
+
+                # Jeśli linia to alfanumeryczny ciąg bez spacji (np. "ARA000613"), pomijamy
+                if re.fullmatch(r"[A-Za-z0-9]+", next_ln):
+                    j += 1
+                    continue
+
+                # W przeciwnym razie traktujemy to jako kontynuację nazwy
+                name_parts.append(next_ln.strip())
+                j += 1
+
+            # Złączone fragmenty nazwy
+            Name_val = " ".join(name_parts).strip()
+
+            products.append({
+                "Lp": Lp_val,
+                "Name": Name_val,
+                "Quantity": Quantity_val,
+                "Barcode": barcode
+            })
+
+            # Przeskakujemy i ustawiamy i = j, aby pominąć już przetworzone linie
+            i = j
+        else:
+            i += 1
+
+    return pd.DataFrame(products)
 
 
 def parse_layout_d(all_lines: list[str]) -> pd.DataFrame:
@@ -227,7 +302,7 @@ if uploaded_file is None:
 # 2) Pobierz bajty PDF-a
 pdf_bytes = uploaded_file.read()
 
-# 3) Ekstrakcja tekstu przez pdfplumber
+# 3) Ekstrakcja tekstu przy pomocy pdfplumber
 all_lines = extract_text_with_pdfplumber(pdf_bytes)
 
 # 4) Sprawdź, czy udało się znaleźć jakikolwiek 13-cyfrowy EAN
@@ -242,20 +317,27 @@ if not found_ean:
     )
     st.stop()
 
-# 6) Wykryj układ D – EAN + ilość w tej samej linii, bez Lp
+# 6) Wykryj układ E – Lp + nazwa + ilość w jednej linii + poniżej „Kod kres.: <EAN>”
+pattern_e = re.compile(r"^\d+\s+.+?\s+\d{1,3}\s+szt\.", flags=re.IGNORECASE)
+has_kod_kres = any(ln.lower().startswith("kod kres") for ln in all_lines)
+is_layout_e = any(pattern_e.match(ln) for ln in all_lines) and has_kod_kres
+
+# 7) Wykryj układ D – EAN + ilość w tej samej linii, bez Lp
 pattern_d = re.compile(r"^\d{13}(?:\s+.*?)*\s+\d{1,3},\d{2}\s+szt", flags=re.IGNORECASE)
 is_layout_d = any(pattern_d.match(ln) for ln in all_lines)
 
-# 7) Wykryj układ B (Lp + EAN w jednej linii)
+# 8) Wykryj układ B (Lp + EAN w jednej linii)
 pattern_b = re.compile(r"^\d+\s+\d{13}\s+.+\s+\d{1,3},\d{2}\s+szt", flags=re.IGNORECASE)
 is_layout_b = any(pattern_b.match(ln) for ln in all_lines)
 
-# 8) Wykryj układ C (czysty 13-cyfrowy EAN w linii, ale nie układ B ani D)
+# 9) Wykryj układ C (czysty 13-cyfrowy EAN w linii, ale nie układ B ani D)
 has_pure_ean = any(re.fullmatch(r"\d{13}", ln) for ln in all_lines)
 is_layout_c = has_pure_ean and not is_layout_b and not is_layout_d
 
-# 9) Parsuj w zależności od układu
-if is_layout_d:
+# 10) Parsuj w zależności od wykrytego układu
+if is_layout_e:
+    df = parse_layout_e(all_lines)
+elif is_layout_d:
     df = parse_layout_d(all_lines)
 elif is_layout_b:
     df = parse_layout_b(all_lines)
@@ -264,11 +346,11 @@ elif is_layout_c:
 else:
     df = parse_layout_a(all_lines)
 
-# 10) Odfiltruj wiersze bez nazwy lub ilości (jeśli kolumny istnieją)
+# 11) Odfiltruj wiersze bez nazwy lub ilości (jeśli kolumny istnieją)
 if "Name" in df.columns and "Quantity" in df.columns:
     df = df.dropna(subset=["Quantity"]).reset_index(drop=True)
 
-# 11) Sprawdź, czy po parsowaniu wydobyto cokolwiek
+# 12) Sprawdź, czy po parsowaniu wydobyto cokolwiek
 if df.empty:
     st.error(
         "Po parsowaniu nie znaleziono pozycji zamówienia. "
@@ -276,11 +358,11 @@ if df.empty:
     )
     st.stop()
 
-# 12) Wyświetl w Streamlit
+# 13) Wyświetl w Streamlit
 st.subheader("Wyekstrahowane pozycje zamówienia")
 st.dataframe(df, use_container_width=True)
 
-# 13) Przycisk do pobrania pliku Excel
+# 14) Przycisk do pobrania pliku Excel
 def convert_df_to_excel(df_in: pd.DataFrame) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:

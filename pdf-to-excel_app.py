@@ -1,5 +1,3 @@
-# app.py
-
 import streamlit as st
 import pandas as pd
 import re
@@ -16,12 +14,14 @@ st.markdown(
     2. Jeśli nie znajdzie ani jednej niepustej linii (zbyt „zaszyfrowany” PDF/obraz),
        wyświetli komunikat, że wymagana jest warstwa tekstu (OCR).
     3. Gdy już mamy listę wierszy (`all_lines`), wykrywamy układ:
+       - **Układ D**: proste linie zawierające tylko EAN i ilość, np.
+         `5029040012366 Nazwa Produktu 96,00 szt.` lub `5029040012366 96,00 szt.`
        - **Układ B**: jedna pozycja w jednym wierszu, np.
          `1 5029040012366 Nazwa Produktu 96,00 szt.`  
        - **Układ C**: czysty wiersz z 13-cyfrowym EAN, potem numer Lp, potem nazwa, „szt.”, ilość.  
        - **Układ A**: „Kod kres.: <EAN>” w osobnej linii, Lp w osobnej linii (czysta liczba), 
          fragmenty nazwy przed i po kolumnie z ceną/ilością.
-    4. W zależności od wykrytego układu wywołujemy odpowiedni parser (A, B lub C).
+    4. W zależności od wykrytego układu wywołujemy odpowiedni parser (D, A, B lub C).
     5. Wyświetlamy tabelę z kolumnami `Lp`, `Name`, `Quantity`, `Barcode` i umożliwiamy pobranie pliku Excel.
     """
 )
@@ -44,6 +44,35 @@ def extract_text_with_pypdf2(pdf_bytes: bytes) -> list[str]:
             if stripped:
                 lines.append(stripped)
     return lines
+
+
+def parse_layout_d(all_lines: list[str]) -> pd.DataFrame:
+    """
+    Parser dla układu D – proste linie zawierające EAN i ilość, np.:
+      5029040012366 Nazwa Produktu 96,00 szt.
+      lub 5029040012366 96,00 szt.
+    Wyciąga tylko Barcode (EAN) i Quantity. Lp jest ustalane jako kolejność, Name zostaje puste.
+    """
+    products = []
+    # Wzorzec znajdowania EAN (13 cyfr) i ilości przed "szt."
+    pattern = re.compile(
+        r"^(\d{13})(?:\s+.*?)*\s+(\d{1,3}),\d{2}\s+szt",
+        flags=re.IGNORECASE
+    )
+    lp_counter = 1
+    for ln in all_lines:
+        m = pattern.match(ln)
+        if m:
+            Barcode_val = m.group(1)
+            Quantity_val = int(m.group(2).replace(" ", ""))
+            products.append({
+                "Lp": lp_counter,
+                "Name": "",
+                "Quantity": Quantity_val,
+                "Barcode": Barcode_val
+            })
+            lp_counter += 1
+    return pd.DataFrame(products)
 
 
 def parse_layout_b(all_lines: list[str]) -> pd.DataFrame:
@@ -217,31 +246,37 @@ if not all_lines:
     )
     st.stop()
 
-# 5) Wykryj układ B (Lp + EAN w jednej linii)
+# 5) Wykryj układ D – EAN + ilość w tej samej linii, bez Lp
+pattern_d = re.compile(r"^\d{13}(?:\s+.*?)*\s+\d{1,3},\d{2}\s+szt", flags=re.IGNORECASE)
+is_layout_d = any(pattern_d.match(ln) for ln in all_lines)
+
+# 6) Wykryj układ B (Lp + EAN w jednej linii)
 pattern_b = re.compile(r"^\d+\s+\d{13}\s+.+\s+\d{1,3},\d{2}\s+szt", flags=re.IGNORECASE)
 is_layout_b = any(pattern_b.match(ln) for ln in all_lines)
 
-# 6) Wykryj układ C (czysty 13-cyfrowy EAN w linii, ale nie układ B)
+# 7) Wykryj układ C (czysty 13-cyfrowy EAN w linii, ale nie układ B ani D)
 has_pure_ean = any(re.fullmatch(r"\d{13}", ln) for ln in all_lines)
-is_layout_c = has_pure_ean and not is_layout_b
+is_layout_c = has_pure_ean and not is_layout_b and not is_layout_d
 
-# 7) Parsuj w zależności od układu
-if is_layout_b:
+# 8) Parsuj w zależności od układu
+if is_layout_d:
+    df = parse_layout_d(all_lines)
+elif is_layout_b:
     df = parse_layout_b(all_lines)
 elif is_layout_c:
     df = parse_layout_c(all_lines)
 else:
     df = parse_layout_a(all_lines)
 
-# 8) Odfiltruj wiersze bez nazwy lub ilości (jeśli kolumny istnieją)
+# 9) Odfiltruj wiersze bez nazwy lub ilości (jeśli kolumny istnieją)
 if "Name" in df.columns and "Quantity" in df.columns:
-    df = df.dropna(subset=["Name", "Quantity"]).reset_index(drop=True)
+    df = df.dropna(subset=["Quantity"]).reset_index(drop=True)
 
-# 9) Wyświetl w Streamlit
+# 10) Wyświetl w Streamlit
 st.subheader("Wyekstrahowane pozycje zamówienia")
 st.dataframe(df, use_container_width=True)
 
-# 10) Przycisk do pobrania pliku Excel
+# 11) Przycisk do pobrania pliku Excel
 def convert_df_to_excel(df_in: pd.DataFrame) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:

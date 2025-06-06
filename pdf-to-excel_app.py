@@ -5,47 +5,109 @@ import pandas as pd
 import re
 import PyPDF2
 import io
+import subprocess
+import tempfile
+import os
 
 st.set_page_config(page_title="PDF → Excel", layout="wide")
 st.title("PDF → Excel")
 
 st.markdown(
     """
-    Wgraj plik PDF ze zamówieniem. Aplikacja:
-    1. Próbuje wyciągnąć tekst przez PyPDF2.
-    2. Jeśli nie ma ani jednej czytelnej linii, kończy działanie i prosi o PDF z osadzonym tekstem (lub OCR).
-    3. Na wyciągniętych wierszach wykrywa układ:
-       - **Układ B**: cała pozycja w jednym wierszu:  
-         `<Lp> <EAN(13)> <pełna nazwa> <ilość>,<xx> szt.`  
-       - **Układ A**: numer Lp w osobnej linii (czysta liczba), `Kod kres.: <EAN>` w osobnej linii,
-         fragmenty nazwy przed i po kolumnie z cenami/ilością.
-    4. Wyświetla tabelę z kolumnami `Lp`, `Name`, `Quantity`, `Barcode`.
-    5. Pozwala na pobranie wyników jako plik Excel.
+    Wgraj plik PDF ze zamówieniem. Aplikacja działa tak:
+    1. Próbujemy odczytać tekst przez PyPDF2.
+    2. Jeżeli nie znajdzie ani jednej sensownej linii, uruchamiamy OCR za pomocą zainstalowanego w systemie programu `tesseract`.
+       - W Streamlit Cloud najczęściej jest już dostępny `tesseract`.  
+       - Konwertujemy każdą stronę PDF na pojedynczy obraz PNG (narzędziem `pdftoppm`, które jest częścią paczki `poppler-utils`),
+         a potem wywołujemy `tesseract --oem 1 --psm 3 <image>.png stdout -l pol`, żeby otrzymać tekst.
+    3. Gdy mamy już listę wierszy tekstu (`all_lines`), wykrywamy układ:
+       - **Układ B**: wiersz pojedynczy, w formie  
+         ```
+         <Lp> <EAN(13)> <pełna nazwa> <ilość>,<xx> szt. ...
+         ```  
+         – wyciągamy te cztery pola (Lp, Barcode, Name, Quantity).
+       - **Układ A**: Lp to samodzielna linia z liczbą, „Kod kres.: <EAN>” jest w osobnej linii, a nazwa może być rozbita przed i po kolumnie cen.  
+       – Stary parser dla Układu A przypisuje każdemu Lp kod EAN z najbliższej linii „Kod kres” i scala fragmenty nazwy przed i po kolumnie cen.
+    4. Wyświetlamy wynik jako tabelę i umożliwiamy pobranie pliku Excel.
     """
 )
 
+# ──────────────────────────────────────────────────────────────────────────────
 
-def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> list[str]:
+def extract_text_with_py(pdf_bytes: bytes) -> list[str]:
     """
-    Próbujemy wyciągnąć tekst stronami przez PyPDF2.
-    Jeśli żadna linia nie zostanie wyciągnięta, zwracamy pustą listę.
+    Wyciąga każdą niepustą linię tekstu przez PyPDF2.
+    Zwraca listę wierszy; jeśli jest pusta, oznacza, że PyPDF2 nie znalazł tekstu.
     """
     reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
-    all_lines = []
+    lines = []
     for page in reader.pages:
         text = page.extract_text() or ""
         for ln in text.split("\n"):
             stripped = ln.strip()
             if stripped:
-                all_lines.append(stripped)
-    return all_lines
+                lines.append(stripped)
+    return lines
+
+
+def ocr_pdf_to_lines(pdf_bytes: bytes) -> list[str]:
+    """
+    Jeżeli PDF nie zawiera osadzonego tekstu, konwertujemy każdą stronę na obraz PNG
+    (poprzez narzędzie `pdftoppm`) i robimy OCR przez `tesseract`.
+    Zwracamy listę wierszy.
+    """
+    lines = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Zapiszmy PDF do pliku tymczasowego
+        tmp_pdf = os.path.join(tmpdir, "temp.pdf")
+        with open(tmp_pdf, "wb") as f:
+            f.write(pdf_bytes)
+        # Użyjemy pdftoppm, by prześwietlić strony jako PNG-y
+        # Nazwa plików wyjściowych: page-1.png, page-2.png, ...
+        cmd = ["pdftoppm", "-png", "-r", "300", tmp_pdf, os.path.join(tmpdir, "page")]
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            return []  # pdftoppm może nie być w systemie
+        # Teraz każdy plik page-1.png, page-2.png, ...
+        idx = 1
+        while True:
+            img_path = os.path.join(tmpdir, f"page-{idx}.png")
+            if not os.path.exists(img_path):
+                break
+            # OCR przez tesseract, język polski (język można zmienić, jeśli nie ma 'pol')
+            try:
+                result = subprocess.run(
+                    ["tesseract", img_path, "stdout", "-l", "pol"],
+                    check=True, capture_output=True
+                )
+                text = result.stdout.decode("utf-8", errors="ignore")
+            except Exception:
+                text = ""
+            for ln in text.split("\n"):
+                stripped = ln.strip()
+                if stripped:
+                    lines.append(stripped)
+            idx += 1
+    return lines
+
+
+def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> list[str]:
+    """
+    Najpierw próbujemy PyPDF2. Jeśli nic nie znajdzie, przechodzimy do OCR.
+    """
+    lines = extract_text_with_py(pdf_bytes)
+    if lines:
+        return lines
+    # inaczej OCR:
+    ocr_lines = ocr_pdf_to_lines(pdf_bytes)
+    return ocr_lines
 
 
 def parse_layout_b(all_lines: list[str]) -> pd.DataFrame:
     """
-    Parser dla układu, w którym każda pozycja jest w jednym wierszu:
-      <Lp> <EAN(13)> <pełna nazwa> <ilość>,<xx> szt. <…inne…>
-    Wyciągamy: Lp, Barcode, Name, Quantity.
+    Parser dla układu z EAN w tej samej linii, np.
+    1 5029040012366 Nazwa Produktu ... 96,00 szt. ...
     """
     products = []
     pattern = re.compile(
@@ -70,11 +132,8 @@ def parse_layout_b(all_lines: list[str]) -> pd.DataFrame:
 
 def parse_layout_a(all_lines: list[str]) -> pd.DataFrame:
     """
-    Parser dla układu, gdzie "Kod kres.: <EAN>" jest w osobnej linii.
-    Pozycja Lp to wiersz z czystą liczbą, pod którą jest fragment nazwy.
-    Nazwa może być przed i po kolumnie cen/ilości, a EAN przypisujemy do ostatniego Lp.
+    Parser dla klasycznego układu „Kod kres.: <EAN> w oddzielnej linii”.
     """
-    # 1) Zidentyfikuj indeksy Lp: linia czysta-liczba, a pod nią wiersz z literami
     idx_lp = []
     for i in range(len(all_lines) - 1):
         if re.fullmatch(r"\d+", all_lines[i]):
@@ -87,7 +146,6 @@ def parse_layout_a(all_lines: list[str]) -> pd.DataFrame:
             ):
                 idx_lp.append(i)
 
-    # 2) Zidentyfikuj indeksy linii "Kod kres"
     idx_ean = [i for i, ln in enumerate(all_lines) if ln.startswith("Kod kres")]
 
     products = []
@@ -95,7 +153,7 @@ def parse_layout_a(all_lines: list[str]) -> pd.DataFrame:
         prev_lp = idx_lp[idx - 1] if idx > 0 else -1
         next_lp = idx_lp[idx + 1] if idx + 1 < len(idx_lp) else len(all_lines)
 
-        # 2a) Barcode: spośród e w idx_ean takich, że prev_lp < e < next_lp, wybierz maksymalny
+        # 1) EAN
         barcode = None
         valid_eans = [e for e in idx_ean if prev_lp < e < next_lp]
         if valid_eans:
@@ -104,12 +162,11 @@ def parse_layout_a(all_lines: list[str]) -> pd.DataFrame:
             if len(parts) == 2:
                 barcode = parts[1].strip()
 
-        # 2b) Name i Quantity:
+        # 2) Nazwa + Quantity
         name_parts = []
         qty = None
         qty_idx = None
 
-        # Fragmenty nazwy aż do ilości (czysta liczba + "szt.")
         for j in range(lp_idx + 1, next_lp):
             ln = all_lines[j]
             if re.fullmatch(r"\d+", ln) and (j + 1 < next_lp and all_lines[j + 1].lower() == "szt."):
@@ -126,11 +183,9 @@ def parse_layout_a(all_lines: list[str]) -> pd.DataFrame:
             ):
                 name_parts.append(ln)
 
-        # Jeśli brak qty → pomiń tę pozycję
         if qty_idx is None:
             continue
 
-        # Po odnalezieniu ilości: dodaj dalsze fragmenty nazwy aż do "Kod kres"
         for k in range(qty_idx + 1, next_lp):
             ln2 = all_lines[k]
             if ln2.startswith("Kod kres"):
@@ -161,45 +216,45 @@ def parse_layout_a(all_lines: list[str]) -> pd.DataFrame:
 # 1) FileUploader – wgraj PDF
 uploaded_file = st.file_uploader("Wybierz plik PDF ze zamówieniem", type=["pdf"])
 if uploaded_file is None:
-    st.info("Proszę wgrać plik PDF, aby uruchomić parser.")
+    st.info("Proszę wgrać plik PDF, aby kontynuować.")
     st.stop()
 
 # 2) Pobierz bajty PDF-a
 pdf_bytes = uploaded_file.read()
 
-# 3) Wyciągnij wszystkie linie tekstu przez PyPDF2
+# 3) Wyciągnij wszystkie linie tekstu (PyPDF2 albo OCR)
 all_lines = extract_text_from_pdf_bytes(pdf_bytes)
 
-# 4) Jeśli nie wyciągnięto żadnej linii, daj komunikat i zakończ
+# 4) Jeżeli nadal brak linii → wyświetl komunikat i zakończ
 if not all_lines:
     st.error(
-        "Brak czytelnego tekstu w PDF (prawdopodobnie skan/obraz). "
-        "Aby sparsować, proszę najpierw wykonać OCR lub zapewnić PDF z osadzonym tekstem."
+        "Nie udało się wyciągnąć tekstu z PDF-a. "
+        "Prawdopodobnie jest to czysty skan/obraz. "
+        "Aby go sparsować, najpierw wykonaj OCR (np. `tesseract`) lokalnie."
     )
     st.stop()
 
-# 5) Wykryj Układ B (Lp + EAN w jednej linii)
+# 5) Wykryj układ B: Lp + EAN w jednej linii
 pattern_b = re.compile(
     r"^\d+\s+\d{13}\s+.+\s+\d{1,3},\d{2}\s+szt", flags=re.IGNORECASE
 )
 is_layout_b = any(pattern_b.match(ln) for ln in all_lines)
 
-# 6) Parsuj w zależności od wykrytego układu
+# 6) Parsowanie w zależności od układu
 if is_layout_b:
     df = parse_layout_b(all_lines)
 else:
     df = parse_layout_a(all_lines)
 
-# 7) Jeżeli DataFrame ma kolumny "Name" i "Quantity", usuń wiersze, w których są puste.
-#    Jeśli którejś z tych kolumn brak, po prostu je pomijamy (bez KeyError).
+# 7) Jeśli kolumny "Name" i "Quantity" istnieją, odfiltruj brakujące
 if "Name" in df.columns and "Quantity" in df.columns:
     df = df.dropna(subset=["Name", "Quantity"]).reset_index(drop=True)
 
-# 8) Wyświetl tabelę w Streamlit
+# 8) Wyświetl wynik
 st.subheader("Wyekstrahowane pozycje zamówienia")
 st.dataframe(df, use_container_width=True)
 
-# 9) Przycisk do pobrania pliku Excel
+# 9) Przycisk do pobrania Excel
 def convert_df_to_excel(df_in: pd.DataFrame) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:

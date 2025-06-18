@@ -12,18 +12,14 @@ st.markdown(
     Wgraj plik PDF ze zamówieniem. Aplikacja:
     1. Wyciąga wszystkie linie przez pdfplumber.
     2. Usuwa stopki/numerację stron.
-    3. Wykrywa layout (D, E, B, C lub A) i parsuje odpowiednio.
-    4. Wyświetla tabelę wynikową oraz statystyki.
-    5. Umożliwia pobranie wyniku jako plik Excel.
+    3. Wstawia spację między numerem pozycji a nazwą.
+    4. Wykrywa layout (D, E, B, C lub A) i parsuje odpowiednio.
+    5. Wyświetla tabelę wynikową oraz statystyki.
+    6. Umożliwia pobranie wyniku jako plik Excel.
     """
 )
 
-
 def extract_text_with_pdfplumber(pdf_bytes: bytes) -> list[str]:
-    """
-    Wyciąga wszystkie niepuste linie tekstu przy pomocy pdfplumber.
-    Jeśli nic nie znajdzie lub wystąpi błąd, zwraca pustą listę.
-    """
     try:
         lines: list[str] = []
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -37,23 +33,19 @@ def extract_text_with_pdfplumber(pdf_bytes: bytes) -> list[str]:
     except Exception:
         return []
 
-
 def parse_layout_d(all_lines: list[str]) -> pd.DataFrame:
     products = []
-    pattern = re.compile(r"^(\d{13})(?:\s+.*?)*\s+(\d{1,3}),\d{2}\s+szt", flags=re.IGNORECASE)
+    pattern = re.compile(r"^(\d{13})(?:\s+.*?)*\s+(\d{1,3}),\d{2}\s+szt", re.IGNORECASE)
     lp = 1
     for ln in all_lines:
         if m := pattern.match(ln):
-            ean = m.group(1)
-            qty = int(m.group(2).replace(" ", ""))
-            products.append({"Lp": lp, "Symbol": ean, "Ilość": qty})
+            products.append({"Lp": lp, "Symbol": m.group(1), "Ilość": int(m.group(2).replace(" ", ""))})
             lp += 1
     return pd.DataFrame(products)
 
-
 def parse_layout_e(all_lines: list[str]) -> pd.DataFrame:
     products = []
-    pattern_item = re.compile(r"^(\d+)\s+.+?\s+(\d{1,3})\s+szt\.", flags=re.IGNORECASE)
+    pattern_item = re.compile(r"^(\d+)\s+.+?\s+(\d{1,3})\s+szt\.", re.IGNORECASE)
     i = 0
     while i < len(all_lines):
         if m := pattern_item.match(all_lines[i]):
@@ -74,10 +66,9 @@ def parse_layout_e(all_lines: list[str]) -> pd.DataFrame:
             i += 1
     return pd.DataFrame(products)
 
-
 def parse_layout_b(all_lines: list[str]) -> pd.DataFrame:
     products = []
-    pattern = re.compile(r"^(\d+)\s+(\d{13})\s+.+?\s+(\d{1,3}),\d{2}\s+szt", flags=re.IGNORECASE)
+    pattern = re.compile(r"^(\d+)\s+(\d{13})\s+.+?\s+(\d{1,3}),\d{2}\s+szt", re.IGNORECASE)
     for ln in all_lines:
         if m := pattern.match(ln):
             products.append({
@@ -87,9 +78,7 @@ def parse_layout_b(all_lines: list[str]) -> pd.DataFrame:
             })
     return pd.DataFrame(products)
 
-
 def parse_layout_c(all_lines: list[str]) -> pd.DataFrame:
-    # znajdź indeksy Lp i czystych kodów EAN
     idx_lp = [
         i for i in range(len(all_lines)-1)
         if re.fullmatch(r"\d+", all_lines[i])
@@ -99,8 +88,8 @@ def parse_layout_c(all_lines: list[str]) -> pd.DataFrame:
     idx_ean = [i for i, ln in enumerate(all_lines) if re.fullmatch(r"\d{13}", ln)]
     products = []
     for lp_idx in idx_lp:
-        prev_lp = max([e for e in idx_lp if e < lp_idx], default=-1)
-        next_lp = min([e for e in idx_lp if e > lp_idx], default=len(all_lines))
+        prev_lp = max((e for e in idx_lp if e < lp_idx), default=-1)
+        next_lp = min((e for e in idx_lp if e > lp_idx), default=len(all_lines))
         valid = [e for e in idx_ean if prev_lp < e < next_lp]
         ean = all_lines[max(valid)] if valid else ""
         qty = None
@@ -110,7 +99,6 @@ def parse_layout_c(all_lines: list[str]) -> pd.DataFrame:
         if qty is not None:
             products.append({"Lp": int(all_lines[lp_idx]), "Symbol": ean, "Ilość": qty})
     return pd.DataFrame(products)
-
 
 def parse_layout_a(all_lines: list[str]) -> pd.DataFrame:
     idx_lp = [
@@ -137,9 +125,8 @@ def parse_layout_a(all_lines: list[str]) -> pd.DataFrame:
             products.append({"Lp": int(all_lines[lp_idx]), "Symbol": ean, "Ilość": qty})
     return pd.DataFrame(products)
 
-
 # ────────────────────────────────────────────────────────────────────────────
-# GŁÓWNA LOGIKA: zawsze pdfplumber i filtrowanie stron
+# GŁÓWNA LOGIKA
 
 uploaded_file = st.file_uploader("Wybierz plik PDF ze zamówieniem", type=["pdf"])
 if not uploaded_file:
@@ -148,28 +135,34 @@ if not uploaded_file:
 
 pdf_bytes = uploaded_file.read()
 
-# 1) wyciągamy wszystkie linie z pdfplumber
+# 1) Wyciągamy wszystkie linie przez pdfplumber
 lines_all = extract_text_with_pdfplumber(pdf_bytes)
 
-# 2) usuwamy stopki/numerację stron
+# 2) Usuwamy stopki i numerację stron
 lines_all = [
     ln for ln in lines_all
-    if not ln.startswith("/")      # np. "/ Wydrukowano z programu…"
-       and "Strona" not in ln      # linie typu "Strona 1/2"
+    if not ln.startswith("/")      # "/ Wydrukowano z programu…"
+       and "Strona" not in ln      # "Strona 1/3"
 ]
 
-# 3) wykrywamy layout
-pattern_d = re.compile(r"^(\d{13})(?:\s+.*?)*\s+(\d{1,3}),\d{2}\s+szt", flags=re.IGNORECASE)
-pattern_e = re.compile(r"^(\d+)\s+.+?\s+(\d{1,3})\s+szt\.", flags=re.IGNORECASE)
+# 3) Wstawiamy spację między numerem Lp a nazwą, jeśli pdf ją zwinął
+lines_all = [
+    re.sub(r"^(\d+)(?=[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż])", r"\1 ", ln)
+    for ln in lines_all
+]
+
+# 4) Wykrywamy layout
+pattern_d = re.compile(r"^(\d{13})(?:\s+.*?)*\s+(\d{1,3}),\d{2}\s+szt", re.IGNORECASE)
+pattern_e = re.compile(r"^(\d+)\s+.+?\s+(\d{1,3})\s+szt\.", re.IGNORECASE)
 is_d = any(pattern_d.match(ln) for ln in lines_all)
 has_kres = any(ln.lower().startswith("kod kres") for ln in lines_all)
 is_e = any(pattern_e.match(ln) for ln in lines_all) and has_kres
-is_b = any(re.compile(r"^\d+\s+\d{13}\s+.+?\s+\d{1,3},\d{2}\s+szt", flags=re.IGNORECASE).match(ln)
+is_b = any(re.compile(r"^\d+\s+\d{13}\s+.+?\s+\d{1,3},\d{2}\s+szt", re.IGNORECASE).match(ln)
            for ln in lines_all)
 has_plain_ean = any(re.fullmatch(r"\d{13}", ln) for ln in lines_all)
 is_c = has_plain_ean and not is_b
 
-# 4) parsujemy odpowiednią funkcją
+# 5) Parsujemy odpowiednio
 if is_d:
     df = parse_layout_d(lines_all)
 elif is_e:
@@ -181,7 +174,7 @@ elif is_c:
 else:
     df = parse_layout_a(lines_all)
 
-# 5) drop pustych ilości i sprawdzenie
+# 6) Odfiltruj puste ilości i sprawdź
 if "Ilość" in df.columns:
     df = df.dropna(subset=["Ilość"]).reset_index(drop=True)
 
@@ -189,7 +182,7 @@ if df.empty:
     st.error("Po parsowaniu nie znaleziono pozycji zamówienia.")
     st.stop()
 
-# 6) statystyki EAN-ów
+# 7) Statystyki EAN-ów
 total_eans = df.shape[0]
 unique_eans = df["Symbol"].nunique()
 total_qty = int(df["Ilość"].sum())
@@ -200,7 +193,7 @@ st.markdown(
     f"**Łączna suma ilości:** {total_qty}"
 )
 
-# 7) wyświetlenie tabeli i eksport do Excela
+# 8) Wyświetlenie tabeli i eksport do Excela
 st.subheader("Wyekstrahowane pozycje zamówienia")
 st.dataframe(df, use_container_width=True)
 
